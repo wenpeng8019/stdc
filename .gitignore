@@ -1,0 +1,29 @@
+# Build artifacts
+*.o
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+
+# Static library output
+libstdc.a
+stdc.lib
+
+# CMake build directory
+build/
+cmake-build-*/
+
+# Test executables
+test/example
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
