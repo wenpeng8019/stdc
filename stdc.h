@@ -231,8 +231,6 @@ static inline void printf_slot(const char* fmt, ...) {
     // 初始化 mod tag，只执行一次
     if (!*s_tag) {
 
-#pragma clang diagnostic push
-#pragma ide diagnostic ignored "ConstantConditionsOC"
         int n = sizeof(ROOT_TAG);                               // 注意 sizeof 得到的长度(即数组长度), 包括了 \0, 也就是 n = strlen + 1
         // 左对齐固定输出（右侧补空格）
 #       if LOG_TAG_MAX > 0
@@ -265,7 +263,6 @@ static inline void printf_slot(const char* fmt, ...) {
         if (n > 128) sprintf(s_tag, LOG_TAG_L "%.*s" LOG_TAG_R, 128, ROOT_TAG);   // ROOT TAG 太长，大于等于 128，则只显示 ROOT TAG
         else sprintf(s_tag, LOG_TAG_L "%s%.*s" LOG_TAG_R, ROOT_TAG, 128 + 1 - n, (char*)MOD_TAG);
 #       endif
-#pragma clang diagnostic pop
     }
 
     assert(fmt); va_list args = {0};
@@ -281,6 +278,8 @@ static inline void printf_slot(const char* fmt, ...) {
         if (*++fmt == ':') {
 #ifndef NDEBUG
             fmt += fmt[1] == ' ' ? 2 : 1;
+            // 如果 fmt 为空，则 ... 中的第一个参数作为 fmt，即允许 printf("::", fmt) 形式的调用
+            if (!*fmt) fmt = va_arg(args, const char*);
             va_start(args, fmt);
             vprintf(fmt, args);
             va_end(args);
@@ -289,6 +288,8 @@ static inline void printf_slot(const char* fmt, ...) {
         }
         // 否则如果以单 ':' 开头，则同 printf("") 一样开启缓存模式，并直接输出到缓存
         s_begin = true;
+        // 如果 fmt 为空，则 ... 中的第一个参数作为 fmt，即允许 printf(":", fmt) 形式的调用
+        if (!*fmt) fmt = va_arg(args, const char*);
         va_start(args, fmt);
         log_slot(LOG_SLOT_NONE, NULL, fmt, args);
         va_end(args);
@@ -302,6 +303,8 @@ static inline void printf_slot(const char* fmt, ...) {
             level = (log_level_e)(p - q); fmt+=2;
             if (*fmt == ' ') ++fmt;                         // 忽略 1 个且只忽略 1 个空格（即允许多个空格作为缩进）
         }
+        // 如果 fmt 为空，则 ... 中的第一个参数作为 fmt，即允许 printf("D:", fmt) 形式的调用
+        if (!*fmt) fmt = va_arg(args, const char*);
     }
 
     if (s_begin) {
@@ -318,7 +321,7 @@ static inline void printf_slot(const char* fmt, ...) {
     va_end (args);
 }
 
-#define printf(fmt, ...)    printf_slot(fmt, ##__VA_ARGS__)
+#define printf(...)         printf_slot(__VA_ARGS__)
 
 ///////////////////////////////////////////////////////////////////////////////
 /**
@@ -1596,7 +1599,7 @@ static inline void P_net_cleanup(void) {
 #define P_net_cleanup()     ((void)0)
 #endif
 
-static inline int P_net_errno(void) {
+static inline int P_sock_errno(void) {
 #if P_WIN
     return WSAGetLastError();
 #else
@@ -1605,7 +1608,7 @@ static inline int P_net_errno(void) {
 }
 
 // 检查错误是否为"操作进行中"（非阻塞连接）
-static inline bool P_net_errno_is_inprogress(void) {
+static inline bool P_sock_is_inprogress(void) {
 #if P_WIN
     int err = WSAGetLastError();
     return err == WSAEWOULDBLOCK || err == WSAEINPROGRESS;
@@ -1615,7 +1618,7 @@ static inline bool P_net_errno_is_inprogress(void) {
 }
 
 // 检查错误是否为"连接已重置"
-static inline bool P_net_errno_is_connreset(void) {
+static inline bool P_sock_is_connreset(void) {
 #if P_WIN
     return WSAGetLastError() == WSAECONNRESET;
 #else
@@ -1631,14 +1634,14 @@ static inline bool P_net_errno_is_connreset(void) {
 //-----------------------------------------------------------------------------
 
 // 关闭 socket（跨平台差异：closesocket vs close）
-static inline ret_t P_net_close(sock_t s) {
+static inline ret_t P_sock_close(sock_t s) {
     if (s == P_INVALID_SOCKET) return E_INVALID;
 #if P_WIN
     int ret = closesocket(s);
 #else
     int ret = close(s);
 #endif
-    return ret == 0 ? E_NONE : E_EXTERNAL(P_net_errno());
+    return ret == 0 ? E_NONE : E_EXTERNAL(P_sock_errno());
 }
 
 //-----------------------------------------------------------------------------
@@ -1646,7 +1649,7 @@ static inline ret_t P_net_close(sock_t s) {
 //-----------------------------------------------------------------------------
 
 // 设置非阻塞模式
-static inline ret_t P_set_nonblock(sock_t s, bool enable) {
+static inline ret_t P_sock_nonblock(sock_t s, bool enable) {
     if (s == P_INVALID_SOCKET) return E_INVALID;
 #if P_WIN
     u_long mode = enable ? 1 : 0;
@@ -1663,41 +1666,41 @@ static inline ret_t P_set_nonblock(sock_t s, bool enable) {
 }
 
 // 设置地址重用（SO_REUSEADDR）
-static inline ret_t P_set_reuseaddr(sock_t s, bool enable) {
+static inline ret_t P_sock_reuseaddr(sock_t s, bool enable) {
     if (s == P_INVALID_SOCKET) return E_INVALID;
     int opt = enable ? 1 : 0;
     int ret = setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
-    return ret == 0 ? E_NONE : E_EXTERNAL(P_net_errno());
+    return ret == 0 ? E_NONE : E_EXTERNAL(P_sock_errno());
 }
 
 // 设置端口重用（SO_REUSEPORT，仅 POSIX）
 #if !P_WIN
-static inline ret_t P_set_reuseport(sock_t s, bool enable) {
+static inline ret_t P_sock_reuseport(sock_t s, bool enable) {
     if (s == P_INVALID_SOCKET) return E_INVALID;
     int opt = enable ? 1 : 0;
     int ret = setsockopt(s, SOL_SOCKET, SO_REUSEPORT, (const char*)&opt, sizeof(opt));
-    return ret == 0 ? E_NONE : E_EXTERNAL(P_net_errno());
+    return ret == 0 ? E_NONE : E_EXTERNAL(P_sock_errno());
 }
 #endif
 
 // 设置 TCP_NODELAY（禁用 Nagle 算法）
-static inline ret_t P_set_nodelay(sock_t s, bool enable) {
+static inline ret_t P_sock_nodelay(sock_t s, bool enable) {
     if (s == P_INVALID_SOCKET) return E_INVALID;
     int opt = enable ? 1 : 0;
     int ret = setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&opt, sizeof(opt));
-    return ret == 0 ? E_NONE : E_EXTERNAL(P_net_errno());
+    return ret == 0 ? E_NONE : E_EXTERNAL(P_sock_errno());
 }
 
 // 设置 SO_KEEPALIVE
-static inline ret_t P_set_keepalive(sock_t s, bool enable) {
+static inline ret_t P_sock_keepalive(sock_t s, bool enable) {
     if (s == P_INVALID_SOCKET) return E_INVALID;
     int opt = enable ? 1 : 0;
     int ret = setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, (const char*)&opt, sizeof(opt));
-    return ret == 0 ? E_NONE : E_EXTERNAL(P_net_errno());
+    return ret == 0 ? E_NONE : E_EXTERNAL(P_sock_errno());
 }
 
 // 设置发送超时
-static inline ret_t P_set_sndtimeo(sock_t s, int ms) {
+static inline ret_t P_sock_sndtimeo(sock_t s, int ms) {
     if (s == P_INVALID_SOCKET) return E_INVALID;
 #if P_WIN
     DWORD timeout = (DWORD)ms;
@@ -1706,11 +1709,11 @@ static inline ret_t P_set_sndtimeo(sock_t s, int ms) {
     struct timeval tv = { ms / 1000, (ms % 1000) * 1000 };
     int ret = setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 #endif
-    return ret == 0 ? E_NONE : E_EXTERNAL(P_net_errno());
+    return ret == 0 ? E_NONE : E_EXTERNAL(P_sock_errno());
 }
 
 // 设置接收超时
-static inline ret_t P_set_rcvtimeo(sock_t s, int ms) {
+static inline ret_t P_sock_rcvtimeo(sock_t s, int ms) {
     if (s == P_INVALID_SOCKET) return E_INVALID;
 #if P_WIN
     DWORD timeout = (DWORD)ms;
@@ -1719,53 +1722,26 @@ static inline ret_t P_set_rcvtimeo(sock_t s, int ms) {
     struct timeval tv = { ms / 1000, (ms % 1000) * 1000 };
     int ret = setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 #endif
-    return ret == 0 ? E_NONE : E_EXTERNAL(P_net_errno());
+    return ret == 0 ? E_NONE : E_EXTERNAL(P_sock_errno());
 }
 
 // 设置发送缓冲区大小
-static inline ret_t P_set_sndbuf(sock_t s, int size) {
+static inline ret_t P_sock_sndbuf(sock_t s, int size) {
     if (s == P_INVALID_SOCKET) return E_INVALID;
     int ret = setsockopt(s, SOL_SOCKET, SO_SNDBUF, (const char*)&size, sizeof(size));
-    return ret == 0 ? E_NONE : E_EXTERNAL(P_net_errno());
+    return ret == 0 ? E_NONE : E_EXTERNAL(P_sock_errno());
 }
 
 // 设置接收缓冲区大小
-static inline ret_t P_set_rcvbuf(sock_t s, int size) {
+static inline ret_t P_sock_rcvbuf(sock_t s, int size) {
     if (s == P_INVALID_SOCKET) return E_INVALID;
     int ret = setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char*)&size, sizeof(size));
-    return ret == 0 ? E_NONE : E_EXTERNAL(P_net_errno());
+    return ret == 0 ? E_NONE : E_EXTERNAL(P_sock_errno());
 }
 
 //-----------------------------------------------------------------------------
-// 地址转换辅助函数
+// 注意：inet_pton/inet_ntop 已是标准跨平台 API，无需封装
 //-----------------------------------------------------------------------------
-
-// 将字符串 IP 转换为二进制格式
-static inline ret_t P_inet_pton(int af, const char* src, void* dst) {
-    if (!src || !dst) return E_INVALID;
-#if P_WIN
-    // Windows 提供 inet_pton (Vista+)
-    int ret = inet_pton(af, src, dst);
-    if (ret == 1) return E_NONE;
-    if (ret == 0) return E_INVALID;  // 无效格式
-    return E_EXTERNAL(WSAGetLastError());
-#else
-    int ret = inet_pton(af, src, dst);
-    if (ret == 1) return E_NONE;
-    if (ret == 0) return E_INVALID;  // 无效格式
-    return E_EXTERNAL(errno);
-#endif
-}
-
-// 将二进制格式转换为字符串 IP
-static inline const char* P_inet_ntop(int af, const void* src, char* dst, socklen_t size) {
-    if (!src || !dst) return NULL;
-#if P_WIN
-    return inet_ntop(af, src, dst, size);
-#else
-    return inet_ntop(af, src, dst, size);
-#endif
-}
 
 ///////////////////////////////////////////////////////////////////////////////
 // 终端
