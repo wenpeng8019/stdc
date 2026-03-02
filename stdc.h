@@ -63,7 +63,7 @@
 #if P_DARWIN
 #   include <Availability.h>  /* 用于检查 macOS 版本、以及系统 API 可用性 */
 #endif
-#if !P_WIN || defined(__CYGWIN__) || defined(__MINGW32__)
+#if !P_WIN || defined(__CYGWIN__) || defined(__MINGW32__) || defined(__MINGW64__)
 #   include <unistd.h>
 #   include <errno.h>
 #endif
@@ -85,8 +85,14 @@
 //-----------------------------------------------------------------------------
 // 编译器一致性： __GNUC__ 包含 clang 和 gcc; _MSC_VER 包含 Visual Studio
 
+#if P_POSIX_LIKE
+#define P_DIR_SEP '/'
+#else
+#define P_DIR_SEP '\\'
+#endif
+
 #ifndef __FILE_NAME__
-#define __FILE_NAME__ __FILE__
+#define __FILE_NAME__  (strrchr(__FILE__, P_DIR_SEP) ? strrchr(__FILE__, P_DIR_SEP) + 1 : __FILE__)
 #endif
 
 // c++ 优先使用 thread_local，它是 c++ 11 的标准
@@ -108,7 +114,7 @@ extern "C" {
 ///////////////////////////////////////////////////////////////////////////////
 
 #ifdef NDEBUG
-#define P_check(expr, ...) { if (!(expr)) { printf("E: %s@%d(%d)", __FUNCTION__, __LINE__, (int)(long)(expr)); __VA_ARGS__ ;} }
+#define P_check(expr, ...) { if (!(expr)) { print("E: %s@%d(%d)", __FUNCTION__, __LINE__, (int)(long)(expr)); __VA_ARGS__ ;} }
 #else
 #define P_check(expr, ...) assert(expr);
 #endif
@@ -218,7 +224,7 @@ log_output(log_cb cb_log, bool tag_separate);
 void
 log_slot(log_level_e level, const char* tag, const char* fmt, va_list params);
 
-static inline void printf_slot(const char* fmt, ...) {
+static inline void print(const char* fmt, ...) {
 
     // +3: "[]\0"
 #   if LOG_TAG_MAX > 0
@@ -265,63 +271,69 @@ static inline void printf_slot(const char* fmt, ...) {
 #       endif
     }
 
-    assert(fmt); va_list args = {0};
+#ifndef NDEBUG
+    va_list args; va_start(args, fmt);
+    const char* tag = s_tag;
+    log_level_e level = LOG_DEF;
+    static TLS char s_file[256];
+    if (!fmt || !*fmt) {
+        snprintf(tag = s_file, sizeof(s_file), "%s:%d", va_arg(args, const char*), va_arg(args, int));
+        fmt = va_arg(args, const char*);
+        level = LOG_SLOT_DEBUG;
+    }
+#else
+    if (!fmt || !*fmt) return;
+    va_list args; va_start(args, fmt);
+    const char* tag = s_tag;
+    log_level_e level = LOG_DEF;
+#endif
+
     static TLS bool s_begin = false;
 
-    // 如果 printf(""), 开启缓存模式。此外，如果之前已经开启缓存，则清空缓存，从头开始
-    if (!*fmt) { s_begin = true;
-        log_slot(LOG_SLOT_NONE, NULL, NULL, args);
-        return;
-    }
     if (*fmt == ':') {
         // 如果以双 ':' 开头，则在调整状态下，直接输出到标准输出
         if (*++fmt == ':') {
 #ifndef NDEBUG
             fmt += fmt[1] == ' ' ? 2 : 1;
-            // 如果 fmt 为空，则 ... 中的第一个参数作为 fmt，即允许 printf("::", fmt) 形式的调用
+            // 如果 fmt 为空，则 ... 中的第一个参数作为 fmt，即允许 print("::", fmt) 形式的调用
             if (!*fmt) fmt = va_arg(args, const char*);
-            va_start(args, fmt);
             vprintf(fmt, args);
-            va_end(args);
 #endif
+            va_end(args);
             return;
         }
-        // 否则如果以单 ':' 开头，则同 printf("") 一样开启缓存模式，并直接输出到缓存
+        // 否则如果以单 ':' 开头，开启缓存模式。此外，如果之前已经开启缓存，则清空缓存，从头开始
         s_begin = true;
-        // 如果 fmt 为空，则 ... 中的第一个参数作为 fmt，即允许 printf(":", fmt) 形式的调用
+        // 如果 fmt 为空，则 ... 中的第一个参数作为 fmt，即允许 print(":", fmt) 形式的调用
         if (!*fmt) fmt = va_arg(args, const char*);
-        va_start(args, fmt);
         log_slot(LOG_SLOT_NONE, NULL, fmt, args);
         va_end(args);
         return;
     }
 
-    log_level_e level = LOG_DEF;
     if (fmt[1] == ':') {
         const char *q="VDIWEF", *p = strchr(q, *fmt);
         if (p) { s_begin = false;                           // 只要指定 level 标识，就会关闭缓存模式
             level = (log_level_e)(p - q); fmt+=2;
             if (*fmt == ' ') ++fmt;                         // 忽略 1 个且只忽略 1 个空格（即允许多个空格作为缩进）
+            // 如果 fmt 为空，则 ... 中的第一个参数作为 fmt，即允许 print("E:", fmt) 形式的调用
+            if (!*fmt) fmt = va_arg(args, const char*);
         }
-        // 如果 fmt 为空，则 ... 中的第一个参数作为 fmt，即允许 printf("D:", fmt) 形式的调用
-        if (!*fmt) fmt = va_arg(args, const char*);
     }
 
-    if (s_begin) {
-        va_start(args, fmt);
+    if (s_begin)
         log_slot(LOG_SLOT_NONE, NULL, fmt, args);
-        va_end (args);
-        return;
-    }
+    else if (level < LOG_SLOT_NONE)                         // 默认级别为 NONE 时，则默认不输出任何内容
+        log_slot(level, tag, fmt, args);
 
-    if (level >= LOG_SLOT_NONE) return;                     // 如果默认级别为 NONE，则默认不输出任何内容
-
-    va_start(args, fmt);
-    log_slot(level, s_tag, fmt, args);
     va_end (args);
 }
 
-#define printf(...)         printf_slot(__VA_ARGS__)
+#ifndef NDEBUG
+#define printf(...)  print(NULL, __FILE_NAME__, __LINE__, __VA_ARGS__)
+#else
+#define printf(...)  ((void)0)
+#endif
 
 ///////////////////////////////////////////////////////////////////////////////
 /**
@@ -793,7 +805,7 @@ static inline bool P_exe_file(char buffer[], uint32_t size) {
     FILE* fp = fopen("/proc/self/exefile", "r");
     if (!fp) {
         *buffer = '\0';
-        printf("E: read exe path failed: %d\n", errno);
+        print("E: read exe path failed: %d\n", errno);
         return false;
     }
     size = fread(buffer, 1, size, fp);
@@ -1456,7 +1468,7 @@ P_thread(thd_t* r_hThread/* nullable */,
 
     pThread->i32StackSize = !i32StackSize ? 0 : i32StackSize < 0 ? PTHREAD_STACK_MIN : i32StackSize + PTHREAD_STACK_MIN;
 
-    int err;
+    ret_t err;
     pthread_attr_t attr;
     pthread_attr_t* pattr = NULL;
 
@@ -1467,13 +1479,13 @@ P_thread(thd_t* r_hThread/* nullable */,
 #endif
     ) {
         err = pthread_attr_init(&attr);
-        P_check(!err, free(pThread); return E_EXTERNAL(err);)
+        if (err) { free(pThread); return E_EXTERNAL(err); }
         pattr = &attr;
         
         do {
             if (pThread->i32StackSize) {
                 err = pthread_attr_setstacksize(&attr, pThread->i32StackSize);
-                P_check(!err, break;)
+                if (err) break;
             }
 
 #if defined(__ANDROID__)
@@ -1483,7 +1495,7 @@ P_thread(thd_t* r_hThread/* nullable */,
             err = pthread_attr_setschedpolicy(&attr, pThread->ePolicy == P_THD_IDLE       ? SCHED_IDLE :
                                                          pThread->ePolicy == P_THD_BACKGROUND ? SCHED_BATCH :
                                                                                                 SCHED_OTHER);
-            P_check(!err, break;)
+            if (err) break;
 
             struct sched_param param = {0};
             switch (pThread->ePolicy) {
@@ -1494,7 +1506,7 @@ P_thread(thd_t* r_hThread/* nullable */,
                 default:;
             }
             err = pthread_attr_setschedparam(&attr, &param);
-            P_check(!err, break;)
+            if (err) break;
 #endif
 
         } while (0);
@@ -1508,10 +1520,10 @@ P_thread(thd_t* r_hThread/* nullable */,
 
     err = pthread_create(&pHandle, pattr, proto_thd_proc, pThread);
     if (pattr) pthread_attr_destroy(&attr);
-    P_check(!err,
+    if (err) {
         free(pThread);
         return E_EXTERNAL(err);
-    )
+    }
 
     if (r_hThread) *r_hThread = pHandle;
     else pthread_detach(pHandle);
@@ -1525,11 +1537,8 @@ static inline ret_t P_join(thd_t hThread, int32_t* r_i32ExitCode/* nullable */) 
     P_check(hThread, return E_INVALID;)
 
 #if P_WIN
-    P_check(WaitForSingleObject(hThread, INFINITE) == WAIT_OBJECT_0,
-        return E_EXTERNAL(GetLastError());
-    )
-    if (r_i32ExitCode) {
-        DWORD dwExitCode = 0;
+    if (WaitForSingleObject(hThread, INFINITE) != WAIT_OBJECT_0) return E_EXTERNAL(GetLastError());
+    if (r_i32ExitCode) { DWORD dwExitCode = 0;
         if (GetExitCodeThread(hThread, &dwExitCode)) {
             *r_i32ExitCode = (int32_t)dwExitCode;
         } else {
@@ -1540,9 +1549,7 @@ static inline ret_t P_join(thd_t hThread, int32_t* r_i32ExitCode/* nullable */) 
 #else
     void* pExitCode = NULL;
     int err = pthread_join(hThread, &pExitCode);
-    P_check(!err,
-        return E_EXTERNAL(err);
-    )
+    if (err) return E_EXTERNAL(err);
     if (r_i32ExitCode) *r_i32ExitCode = (int32_t)(long)pExitCode;
 #endif
     return E_NONE;

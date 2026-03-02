@@ -154,8 +154,8 @@ ret_t log_slot(int slot, const char* tag, log_cb cb, bool bLine);
 
 ```c
 log_output((log_cb)-2, false);  // 输出到系统日志
-printf("I: 服务器启动于端口 %d\n", 8080);
-printf("E: 连接失败: %s\n", error_msg);
+print("I: 服务器启动于端口 %d\n", 8080);
+print("E: 连接失败: %s\n", error_msg);
 ```
 
 ---
@@ -208,9 +208,9 @@ int main(int argc, char** argv) {
         return 1;
     }
     
-    if (verbose) printf("I: 详细模式已启用\n");
-    printf("I: 端口: %d\n", port);
-    if (host) printf("I: 主机: %s\n", host);
+    if (verbose) print("I: 详细模式已启用\n");
+    print("I: 端口: %d\n", port);
+    if (host) print("I: 主机: %s\n", host);
     
     return 0;
 }
@@ -258,7 +258,7 @@ P_clock_now(&start);
 P_clock_now(&end);
 int64_t elapsed_ms = (end.sec - start.sec) * 1000 + 
                      (end.nsec - start.nsec) / 1000000;
-printf("I: 耗时: %lld 毫秒\n", elapsed_ms);
+print("I: 耗时: %lld 毫秒\n", elapsed_ms);
 ```
 
 ---
@@ -306,12 +306,12 @@ ret_t P_read_link(const char* path, char* buffer, size_t size);
 ```c
 if (P_access("config.ini", true, false)) {
     int64_t size = P_size("config.ini");
-    printf("I: 配置文件大小: %lld 字节\n", size);
+    print("I: 配置文件大小: %lld 字节\n", size);
 }
 
 char exe_path[256];
 if (P_exe_file(exe_path, sizeof(exe_path))) {
-    printf("I: 可执行文件: %s\n", exe_path);
+    print("I: 可执行文件: %s\n", exe_path);
 }
 ```
 
@@ -450,9 +450,9 @@ P_inc(&counter, 1);
 // 原子比较并交换
 int expected = 5;
 if (P_test_and_set(&counter, &expected, 10)) {
-    printf("I: 从 5 改为 10\n");
+    print("I: 从 5 改为 10\n");
 } else {
-    printf("I: 值是 %d，不是 5\n", expected);
+    print("I: 值是 %d，不是 5\n", expected);
 }
 ```
 
@@ -708,7 +708,7 @@ printf(C_RED "错误: " C_RESET "出错了\n");
 if (P_isatty(stdout)) {
     int rows = P_term_rows();
     int cols = P_term_cols();
-    printf("I: 终端大小: %dx%d\n", cols, rows);
+    print("I: 终端大小: %dx%d\n", cols, rows);
     
     printf(C_GREEN "成功!" C_RESET "\n");
 }
@@ -729,9 +729,9 @@ bool is_little_endian(void);  // 小端系统上返回 true
 
 ```c
 if (is_little_endian()) {
-    printf("I: 系统是小端字节序\n");
+    print("I: 系统是小端字节序\n");
 } else {
-    printf("I: 系统是大端字节序\n");
+    print("I: 系统是大端字节序\n");
 }
 ```
 

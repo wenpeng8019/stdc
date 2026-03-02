@@ -29,9 +29,9 @@ int main(int argc, char** argv) {
     // 2. 日志系统测试
     printf("\n2. Logging System:\n");
     log_output((log_cb)-2, false);  // 输出到系统日志
-    printf("I: This is an info message\n");
-    printf("W: This is a warning\n");
-    printf("E: This is an error\n");
+    print("I: This is an info message\n");
+    print("W: This is a warning\n");
+    print("E: This is an error\n");
     log_output((log_cb)-1, false);  // 恢复到 stdout
     printf("   Logging test complete\n");
     

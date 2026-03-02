@@ -149,11 +149,11 @@ int main(int argc, char** argv) {
     
     // 使用日志系统（自动使用可执行文件名）
     log_output((log_cb)-2, false);  // 输出到系统日志
-    printf("I: Application started\n");
+    print("I: Application started\n");
     
     // 文件系统操作
     if (P_file_exists("config.ini")) {
-        printf("I: Config file found\n");
+        print("I: Config file found\n");
     }
     
     // 目录遍历
@@ -221,7 +221,7 @@ E_NO_PERMISSION (-12)// 无权限
 ```c
 log_output((log_cb)-1, false);  // stdout
 log_output((log_cb)-2, false);  // 系统日志 (syslog/os_log)
-printf("I: 信息 %d\n", value);  // 自动识别级别 (V/D/I/W/E/F)
+print("I: 信息 %d\n", value);  // 自动识别级别 (V/D/I/W/E/F)
 ```
 
 ### 命令行参数（全局作用域定义）
