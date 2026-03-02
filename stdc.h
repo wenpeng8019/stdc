@@ -530,6 +530,47 @@ int ARGS_ls_count(arg_var_st* var);
 #error "Unknown byte order"
 #endif
 
+// 从字节数组直接读取网络字节序（大端）数据并转换为主机字节序
+// + 避免未对齐访问，适用于从网络包 payload 直接读取
+// 将主机字节序数据写入字节数组（网络字节序/大端）
+// + 避免未对齐访问，适用于构造网络包 payload
+#if IS_BIG_ENDIAN
+#   define nbtohs(bs, result)   memcpy((result), (bs), 2)
+#   define nbtohl(bs, result)   memcpy((result), (bs), 4)
+#   define nbtohll(bs, result)  memcpy((result), (bs), 8)
+#   define hstonb(h, bs)        memcpy((bs), &(h), 2)
+#   define hltonb(h, bs)        memcpy((bs), &(h), 4)
+#   define hlltonb(h, bs)       memcpy((bs), &(h), 8)
+#else
+#   define nbtohs(bs, result)   (*(result) = ((uint16_t)(bs)[0] << 8) | (uint16_t)(bs)[1])
+#   define nbtohl(bs, result)   (*(result) = ((uint32_t)(bs)[0] << 24) | \
+                                             ((uint32_t)(bs)[1] << 16) | \
+                                             ((uint32_t)(bs)[2] << 8) | \
+                                             (uint32_t)(bs)[3])
+#   define nbtohll(bs, result)  (*(result) = ((uint64_t)(bs)[0] << 56) | \
+                                             ((uint64_t)(bs)[1] << 48) | \
+                                             ((uint64_t)(bs)[2] << 40) | \
+                                             ((uint64_t)(bs)[3] << 32) | \
+                                             ((uint64_t)(bs)[4] << 24) | \
+                                             ((uint64_t)(bs)[5] << 16) | \
+                                             ((uint64_t)(bs)[6] << 8) | \
+                                             (uint64_t)(bs)[7])
+#   define hstonb(h, bs)        ((bs)[0] = (uint8_t)((h) >> 8), \
+                                 (bs)[1] = (uint8_t)((h) & 0xFF))
+#   define hltonb(h, bs)        ((bs)[0] = (uint8_t)((h) >> 24), \
+                                 (bs)[1] = (uint8_t)((h) >> 16), \
+                                 (bs)[2] = (uint8_t)((h) >> 8), \
+                                 (bs)[3] = (uint8_t)((h) & 0xFF))
+#   define hlltonb(h, bs)       ((bs)[0] = (uint8_t)((h) >> 56), \
+                                 (bs)[1] = (uint8_t)((h) >> 48), \
+                                 (bs)[2] = (uint8_t)((h) >> 40), \
+                                 (bs)[3] = (uint8_t)((h) >> 32), \
+                                 (bs)[4] = (uint8_t)((h) >> 24), \
+                                 (bs)[5] = (uint8_t)((h) >> 16), \
+                                 (bs)[6] = (uint8_t)((h) >> 8), \
+                                 (bs)[7] = (uint8_t)((h) & 0xFF))
+#endif
+
 static inline bool is_little_endian(void) { int i = 1; return *(char*)&i; }
 
 ///////////////////////////////////////////////////////////////////////////////
