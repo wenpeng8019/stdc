@@ -116,7 +116,7 @@ extern "C" {
 #ifdef NDEBUG
 #define P_check(expr, ...) { if (!(expr)) { print("E: %s@%d(%d)", __FUNCTION__, __LINE__, (int)(long)(expr)); __VA_ARGS__ ;} }
 #else
-#define P_check(expr, ...) assert(expr);
+#define P_check(expr, ...) assert(expr); if (!(expr)) exit(-1);
 #endif
 
 typedef char*                   str_t;
