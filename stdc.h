@@ -477,6 +477,71 @@ int ARGS_print(const char* arg0);
 int ARGS_ls_count(arg_var_st* var);
 
 ///////////////////////////////////////////////////////////////////////////////
+// 内存对齐
+///////////////////////////////////////////////////////////////////////////////
+
+// 返回类型的对齐要求（字节数）
+#if defined(__cplusplus)
+#   define ALIGN_OF(type)   alignof(type)
+#elif __STDC_VERSION__ >= 201112L
+#   define ALIGN_OF(type)   _Alignof(type)
+#elif defined(_MSC_VER)
+#   define ALIGN_OF(type)   __alignof(type)
+#else
+#   define ALIGN_OF(type)   __alignof__(type)
+#endif
+
+// 平台最大对齐要求（malloc/calloc 保证的对齐）
+// + C11: stddef.h 定义了 max_align_t
+// + 旧标准：手动定义为包含所有最大对齐类型的 union
+#if __STDC_VERSION__ >= 201112L
+    // C11 already defines max_align_t in stddef.h (included above)
+#   define MAX_ALIGN        ALIGN_OF(max_align_t)
+#elif defined(__cplusplus) && __cplusplus >= 201103L
+    // C++11 has std::max_align_t
+#   include <cstddef>
+    typedef std::max_align_t max_align_t;
+#   define MAX_ALIGN        ALIGN_OF(max_align_t)
+#else
+    // Pre-C11: define manually
+    typedef union {
+        long long ll;
+        long double ld;
+        void *p;
+        double d;
+    } max_align_t;
+#   define MAX_ALIGN        ALIGN_OF(max_align_t)
+#endif
+
+// 声明对齐属性
+// + 用法: ALIGN_AS(16) uint8_t buf[64];
+// + 如果直接使用对象类型（如结构体）定义，则默认会对齐为类型的自然对齐，即无需显式通过 ALIGN_AS 指定对齐
+#if defined(_MSC_VER)
+#   define ALIGN_AS(n)      __declspec(align(n))
+#else
+#   define ALIGN_AS(n)      __attribute__((aligned(n)))
+#endif
+
+// 检查指针是否按指定字节数对齐
+// + 用法: if (IS_ALIGNED(ptr, 4)) { ... }
+#define IS_ALIGNED(ptr, n)  (((uintptr_t)(ptr) & ((n) - 1)) == 0)
+
+// 主机字节序的未对齐安全读写（不做字节序转换，仅解决对齐问题）
+// + 前提：数据字节序与本机一致（本机存、本机取）
+// read_x/write_x: 通过指针读写，read_s(&result, bytes) / write_s(bytes, value)
+// get_x: 返回值版本，uint16_t val = get_s(bytes)
+// + memcpy 会被编译器优化为单条 load/store 指令
+static inline uint16_t get_s(const void *src)  { uint16_t v; memcpy(&v, src, 2); return v; }
+static inline uint32_t get_l(const void *src)  { uint32_t v; memcpy(&v, src, 4); return v; }
+static inline uint64_t get_ll(const void *src) { uint64_t v; memcpy(&v, src, 8); return v; }
+#define read_s(sp, bytes)   memcpy((sp), (bytes), 2)
+#define read_l(lp, bytes)   memcpy((lp), (bytes), 4)
+#define read_ll(llp, bytes) memcpy((llp), (bytes), 8)
+#define write_s(bytes, s)   memcpy((bytes), &(s), 2)
+#define write_l(bytes, l)   memcpy((bytes), &(l), 4)
+#define write_ll(bytes, ll) memcpy((bytes), &(ll), 8)
+
+///////////////////////////////////////////////////////////////////////////////
 // 字节序
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -530,45 +595,55 @@ int ARGS_ls_count(arg_var_st* var);
 #error "Unknown byte order"
 #endif
 
-// 从字节数组直接读取网络字节序（大端）数据并转换为主机字节序
-// + 避免未对齐访问，适用于从网络包 payload 直接读取
-// 将主机字节序数据写入字节数组（网络字节序/大端）
-// + 避免未对齐访问，适用于构造网络包 payload
+// 网络字节序（大端）的未对齐安全读写（同时完成字节序转换）
+// nread/nwrite: 通过指针读写，nread_s(&result, bytes) / nwrite_s(bytes, value)
+// nget: 返回值版本，uint16_t port = nget_s(bytes)
+// + 避免未对齐访问，适用于从网络包 payload 直接读取/构造
 #if IS_BIG_ENDIAN
-#   define nbtohs(bs, result)   memcpy((result), (bs), 2)
-#   define nbtohl(bs, result)   memcpy((result), (bs), 4)
-#   define nbtohll(bs, result)  memcpy((result), (bs), 8)
-#   define hstonb(h, bs)        memcpy((bs), &(h), 2)
-#   define hltonb(h, bs)        memcpy((bs), &(h), 4)
-#   define hlltonb(h, bs)       memcpy((bs), &(h), 8)
+#   define nread_s(bytes, result)   memcpy((result), (bytes), 2)
+#   define nread_l(bytes, result)   memcpy((result), (bytes), 4)
+#   define nread_ll(bytes, result)  memcpy((result), (bytes), 8)
+#   define nwrite_s(h, bytes)       memcpy((bytes), &(h), 2)
+#   define nwrite_l(h, bytes)       memcpy((bytes), &(h), 4)
+#   define nwrite_ll(h, bytes)      memcpy((bytes), &(h), 8)
+#   define nget_s(b)                get_s(b)
+#   define nget_l(b)                get_l(b)
+#   define nget_ll(b)               get_ll(b)
 #else
-#   define nbtohs(bs, result)   (*(result) = ((uint16_t)(bs)[0] << 8) | (uint16_t)(bs)[1])
-#   define nbtohl(bs, result)   (*(result) = ((uint32_t)(bs)[0] << 24) | \
-                                             ((uint32_t)(bs)[1] << 16) | \
-                                             ((uint32_t)(bs)[2] << 8) | \
-                                             (uint32_t)(bs)[3])
-#   define nbtohll(bs, result)  (*(result) = ((uint64_t)(bs)[0] << 56) | \
-                                             ((uint64_t)(bs)[1] << 48) | \
-                                             ((uint64_t)(bs)[2] << 40) | \
-                                             ((uint64_t)(bs)[3] << 32) | \
-                                             ((uint64_t)(bs)[4] << 24) | \
-                                             ((uint64_t)(bs)[5] << 16) | \
-                                             ((uint64_t)(bs)[6] << 8) | \
-                                             (uint64_t)(bs)[7])
-#   define hstonb(h, bs)        ((bs)[0] = (uint8_t)((h) >> 8), \
-                                 (bs)[1] = (uint8_t)((h) & 0xFF))
-#   define hltonb(h, bs)        ((bs)[0] = (uint8_t)((h) >> 24), \
-                                 (bs)[1] = (uint8_t)((h) >> 16), \
-                                 (bs)[2] = (uint8_t)((h) >> 8), \
-                                 (bs)[3] = (uint8_t)((h) & 0xFF))
-#   define hlltonb(h, bs)       ((bs)[0] = (uint8_t)((h) >> 56), \
-                                 (bs)[1] = (uint8_t)((h) >> 48), \
-                                 (bs)[2] = (uint8_t)((h) >> 40), \
-                                 (bs)[3] = (uint8_t)((h) >> 32), \
-                                 (bs)[4] = (uint8_t)((h) >> 24), \
-                                 (bs)[5] = (uint8_t)((h) >> 16), \
-                                 (bs)[6] = (uint8_t)((h) >> 8), \
-                                 (bs)[7] = (uint8_t)((h) & 0xFF))
+#   define nread_s(sp, bytes)       (*(sp) = ((uint16_t)(bytes)[0] << 8) | (uint16_t)(bytes)[1])
+#   define nread_l(lp, bytes)       (*(lp) = ((uint32_t)(bytes)[0] << 24) | \
+                                             ((uint32_t)(bytes)[1] << 16) | \
+                                             ((uint32_t)(bytes)[2] << 8) | \
+                                             (uint32_t)(bytes)[3])
+#   define nread_ll(llp, bytes)     (*(llp) = ((uint64_t)(bytes)[0] << 56) | \
+                                              ((uint64_t)(bytes)[1] << 48) | \
+                                              ((uint64_t)(bytes)[2] << 40) | \
+                                              ((uint64_t)(bytes)[3] << 32) | \
+                                              ((uint64_t)(bytes)[4] << 24) | \
+                                              ((uint64_t)(bytes)[5] << 16) | \
+                                              ((uint64_t)(bytes)[6] << 8) | \
+                                              (uint64_t)(bytes)[7])
+#   define nwrite_s(bytes, s)       ((bytes)[0] = (uint8_t)((s) >> 8), \
+                                     (bytes)[1] = (uint8_t)((s) & 0xFF))
+#   define nwrite_l(bytes, l)       ((bytes)[0] = (uint8_t)((l) >> 24), \
+                                     (bytes)[1] = (uint8_t)((l) >> 16), \
+                                     (bytes)[2] = (uint8_t)((l) >> 8), \
+                                     (bytes)[3] = (uint8_t)((l) & 0xFF))
+#   define nwrite_ll(bytes, ll)     ((bytes)[0] = (uint8_t)((ll) >> 56), \
+                                     (bytes)[1] = (uint8_t)((ll) >> 48), \
+                                     (bytes)[2] = (uint8_t)((ll) >> 40), \
+                                     (bytes)[3] = (uint8_t)((ll) >> 32), \
+                                     (bytes)[4] = (uint8_t)((ll) >> 24), \
+                                     (bytes)[5] = (uint8_t)((ll) >> 16), \
+                                     (bytes)[6] = (uint8_t)((ll) >> 8), \
+                                     (bytes)[7] = (uint8_t)((ll) & 0xFF))
+#   define nget_s(b)                (((uint16_t)(b)[0] << 8) | (uint16_t)(b)[1])
+#   define nget_l(b)                (((uint32_t)(b)[0] << 24) | ((uint32_t)(b)[1] << 16) | \
+                                     ((uint32_t)(b)[2] << 8)  | (uint32_t)(b)[3])
+#   define nget_ll(b)               (((uint64_t)(b)[0] << 56) | ((uint64_t)(b)[1] << 48) | \
+                                     ((uint64_t)(b)[2] << 40) | ((uint64_t)(b)[3] << 32) | \
+                                     ((uint64_t)(b)[4] << 24) | ((uint64_t)(b)[5] << 16) | \
+                                     ((uint64_t)(b)[6] << 8)  | (uint64_t)(b)[7])
 #endif
 
 static inline bool is_little_endian(void) { int i = 1; return *(char*)&i; }
