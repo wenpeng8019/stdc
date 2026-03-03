@@ -649,6 +649,164 @@ static inline uint64_t get_ll(const void *src) { uint64_t v; memcpy(&v, src, 8);
 static inline bool is_little_endian(void) { int i = 1; return *(char*)&i; }
 
 ///////////////////////////////////////////////////////////////////////////////
+// 随机数生成
+///////////////////////////////////////////////////////////////////////////////
+
+/*
+ * P_rand_init()   - 初始化随机数生成器（可选，仅降级方案需要）
+ * P_rand32()      - 生成 32 位随机数（加密安全）
+ * P_rand64()      - 生成 64 位随机数（加密安全）
+ * P_rand_bytes()  - 填充随机字节
+ *
+ * 平台实现：
+ *   - macOS/BSD:  arc4random() (ChaCha20, CSPRNG) - 无需初始化
+ *   - Windows:    rand_s() (RtlGenRandom, CSPRNG) - 无需初始化
+ *   - Linux:      /dev/urandom (内核 CSPRNG) - 随用随开，无需初始化
+ *   - 降级方案:   srand(time) + rand() (自动初始化，仅用于测试)
+ *
+ * 性能考虑：
+ *   - Linux 平台采用"随用随开"策略，每次打开/关闭 /dev/urandom
+ *   - 现代内核的 open() 开销很小，适合中低频调用
+ *   - 避免长期占用文件描述符，简化生命周期管理
+ *
+ * 返回值：非零随机数（0 保留为无效值）
+ */
+
+#if P_DARWIN || P_BSD
+    // macOS/BSD: arc4random() 无需初始化
+    static inline void P_rand_init(void) { /* 无操作 */ }
+
+    static inline uint32_t P_rand32(void) {
+        uint32_t r = arc4random();
+        return r ? r : 1;  // 避免返回 0
+    }
+
+    static inline uint64_t P_rand64(void) {
+        uint64_t r = ((uint64_t)arc4random() << 32) | arc4random();
+        return r ? r : 1;
+    }
+
+#elif P_WIN
+    // Windows: rand_s() 在 <stdlib.h> 中，需要定义 _CRT_RAND_S
+    #ifndef _CRT_RAND_S
+        #define _CRT_RAND_S
+    #endif
+
+    #if !(defined(_MSC_VER) && _MSC_VER >= 1400)
+        static bool g_rand_initialized = false;
+    #endif
+
+    static inline void P_rand_init(void) {
+        #if defined(_MSC_VER) && _MSC_VER >= 1400
+            /* rand_s() 无需初始化 */
+        #else
+            /* 降级方案：初始化 rand() */
+            if (!g_rand_initialized) {
+                srand((unsigned int)time(NULL));
+                g_rand_initialized = true;
+            }
+        #endif
+    }
+
+    static inline uint32_t P_rand32(void) {
+        uint32_t r;
+        #if defined(_MSC_VER) && _MSC_VER >= 1400
+            if (rand_s(&r) != 0) r = (uint32_t)time(NULL);
+        #else
+            if (!g_rand_initialized) P_rand_init();
+            r = (uint32_t)rand();  // 降级方案
+        #endif
+        return r ? r : 1;
+    }
+
+    static inline uint64_t P_rand64(void) {
+        uint64_t r;
+        #if defined(_MSC_VER) && _MSC_VER >= 1400
+            uint32_t hi, lo;
+            while (rand_s(&hi) != 0 || rand_s(&lo) != 0) { /* retry */ }
+            r = ((uint64_t)hi << 32) | lo;
+        #else
+            if (!g_rand_initialized) P_rand_init();
+            // 降级方案：组合多个 rand() 调用
+            r = ((uint64_t)rand() << 48) ^ ((uint64_t)rand() << 32) ^
+                ((uint64_t)rand() << 16) ^ (uint64_t)rand();
+        #endif
+        return r ? r : 1;
+    }
+
+#else
+    // Linux/其他 POSIX: 使用 /dev/urandom（随用随开，避免长期占用文件描述符）
+    static bool g_rand_initialized = false;
+
+    static inline void P_rand_init(void) {
+        if (!g_rand_initialized) {
+            /* 初始化 rand() 作为降级方案 */
+            srand((unsigned int)time(NULL));
+            g_rand_initialized = true;
+        }
+    }
+
+    static inline uint32_t P_rand32(void) {
+        uint32_t r;
+        FILE *fp = fopen("/dev/urandom", "rb");
+        
+        if (fp && fread(&r, sizeof(r), 1, fp) == 1) {
+            fclose(fp);
+            /* 成功从 /dev/urandom 读取 */
+        } else {
+            if (fp) fclose(fp);
+            /* 降级方案：使用 rand() */
+            if (!g_rand_initialized) P_rand_init();
+            r = (uint32_t)rand();
+        }
+        return r ? r : 1;
+    }
+
+    static inline uint64_t P_rand64(void) {
+        uint64_t r;
+        FILE *fp = fopen("/dev/urandom", "rb");
+        
+        if (fp && fread(&r, sizeof(r), 1, fp) == 1) {
+            fclose(fp);
+            /* 成功从 /dev/urandom 读取 */
+        } else {
+            if (fp) fclose(fp);
+            /* 降级方案：组合多个 rand() */
+            if (!g_rand_initialized) P_rand_init();
+            r = ((uint64_t)rand() << 48) ^ ((uint64_t)rand() << 32) ^
+                ((uint64_t)rand() << 16) ^ (uint64_t)rand();
+        }
+        return r ? r : 1;
+    }
+#endif
+
+
+/*
+ * P_rand_bytes() - 填充缓冲区为随机字节
+ * @param buf  目标缓冲区
+ * @param len  字节数
+ */
+static inline void P_rand_bytes(void *buf, size_t len) {
+    if (!buf || len == 0) return;
+    
+    uint8_t *p = (uint8_t *)buf;
+    
+    // 每次填充 4 字节，利用 P_rand32()
+    while (len >= 4) {
+        uint32_t r = P_rand32();
+        memcpy(p, &r, 4);
+        p += 4;
+        len -= 4;
+    }
+    
+    // 处理剩余的 1-3 字节
+    if (len > 0) {
+        uint32_t r = P_rand32();
+        memcpy(p, &r, len);
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
 // 系统时间和时钟
 ///////////////////////////////////////////////////////////////////////////////
 
