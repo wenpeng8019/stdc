@@ -969,6 +969,16 @@ static inline ret_t P_time_now(P_clock* clock) {
 #define clock_gt(a,b)      ((a).tv_sec>(b).tv_sec || (a).tv_sec==(b).tv_sec && (a).tv_nsec>(b).tv_nsec)
 #define clock_ge(a,b)      ((a).tv_sec>(b).tv_sec || (a).tv_sec==(b).tv_sec && (a).tv_nsec>=(b).tv_nsec)
 
+static uint64_t P_tick_s(void) { P_clock _clk; P_time_now(&_clk); return clock_s(_clk); }
+static uint64_t P_tick_ms(void) { P_clock _clk; P_time_now(&_clk); return clock_ms(_clk); }
+static uint64_t P_tick_us(void) { P_clock _clk; P_time_now(&_clk); return clock_us(_clk); }
+
+
+// 循环序比较：判断 a 是否比 b 更新
+static bool uint8_circle_newer(uint8_t a, uint8_t b) { uint8_t diff = (uint8_t)(a - b); return diff != 0 && diff < 128; }
+static bool uint16_circle_newer(uint16_t a, uint16_t b) { int32_t diff = (int32_t)((int16_t)(a - b)); return diff > 0; }
+static bool uint32_circle_newer(uint32_t a, uint32_t b) { uint32_t diff = a - b; return diff != 0 && diff < 0x80000000u; }
+
 ///////////////////////////////////////////////////////////////////////////////
 // 文件系统访问
 ///////////////////////////////////////////////////////////////////////////////
