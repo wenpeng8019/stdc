@@ -1917,6 +1917,15 @@ static inline bool P_sock_is_connreset(void) {
 #endif
 }
 
+// 检查错误是否为"被信号中断"（用于 select/recv/send 等调用）
+static inline bool P_sock_is_interrupted(void) {
+#if P_WIN
+    return WSAGetLastError() == WSAEINTR;
+#else
+    return errno == EINTR;
+#endif
+}
+
 //-----------------------------------------------------------------------------
 // Socket 基础操作
 // 注意：bind, listen, accept, connect, send, recv, sendto, recvfrom, shutdown
