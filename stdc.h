@@ -969,9 +969,9 @@ static inline ret_t P_time_now(P_clock* clock) {
 #define clock_gt(a,b)      ((a).tv_sec>(b).tv_sec || (a).tv_sec==(b).tv_sec && (a).tv_nsec>(b).tv_nsec)
 #define clock_ge(a,b)      ((a).tv_sec>(b).tv_sec || (a).tv_sec==(b).tv_sec && (a).tv_nsec>=(b).tv_nsec)
 
-static uint64_t P_tick_s(void) { P_clock _clk; P_time_now(&_clk); return clock_s(_clk); }
-static uint64_t P_tick_ms(void) { P_clock _clk; P_time_now(&_clk); return clock_ms(_clk); }
-static uint64_t P_tick_us(void) { P_clock _clk; P_time_now(&_clk); return clock_us(_clk); }
+static uint64_t P_tick_s(void) { P_clock _clk; P_clock_now(&_clk); return clock_s(_clk); }
+static uint64_t P_tick_ms(void) { P_clock _clk; P_clock_now(&_clk); return clock_ms(_clk); }
+static uint64_t P_tick_us(void) { P_clock _clk; P_clock_now(&_clk); return clock_us(_clk); }
 
 
 // 循环序比较：判断 a 是否比 b 更新
