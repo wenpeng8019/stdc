@@ -724,6 +724,9 @@ static bool inst_init(void) {
     int opt = 1;
     setsockopt(g_inst_sock, SOL_SOCKET, SO_BROADCAST, (const char*)&opt, sizeof(opt));
     setsockopt(g_inst_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+#ifdef SO_REUSEPORT
+    setsockopt(g_inst_sock, SOL_SOCKET, SO_REUSEPORT, (const char*)&opt, sizeof(opt));
+#endif
 
     // bind 到指定端口（收发共用）
     struct sockaddr_in addr;
