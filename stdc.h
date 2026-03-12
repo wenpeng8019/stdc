@@ -426,7 +426,7 @@ static inline void print(const char* fmt, ...) {
 #define instrument      print
 #else
 #define printf(...)     ((void)0)
-#define instrument()    ((void)0)
+#define instrument(...) ((void)0)
 #endif
 
 ///////////////////////////////////////////////////////////////////////////////
