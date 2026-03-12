@@ -12,8 +12,8 @@ static char                     g_log_name[64] = {0};               // 日志名
 
 // 典型以太网 MTU=1500，减去 IP(20) + UDP(8) 头部，保守取 1400
 #define INST_UDP_MAX            1400
-#define INST_HDR_SIZE           5                                   // rid(2) + seq(2) + type(1)
-#define INST_PAYLOAD_MAX        (INST_UDP_MAX - INST_HDR_SIZE)      // 可用数据区
+#define INST_HDR_SIZE           7                                   // rid(2)+seq(2)+type(1)+chn(1)+tag_len(1)
+#define INST_PAYLOAD_MAX        (INST_UDP_MAX - INST_HDR_SIZE)      // 可用数据区 (tag + text)
 #define INST_WINDOW_SIZE        64                                  // 接收端滑动窗口大小（必须为 2 的幂）
 #define INST_WINDOW_MASK        (INST_WINDOW_SIZE - 1)
 
@@ -45,6 +45,13 @@ static bool                     g_inst_local  = false;              // 本地模
 static uint8_t*                 g_inst_bits     = NULL;             // 动态分配
 static uint16_t                 g_inst_bits_len = 0;                // 已分配字节数
 
+// 前向声明
+static void inst_send_buf(uint8_t chn, char* buf, int tag_len, int text_len);
+
+#define LOG_HDR_RESERVE         INST_HDR_SIZE                       // g_line 预留的 header+tag 空间
+
+#else
+#define LOG_HDR_RESERVE         0
 #endif
 
 #ifdef printf
@@ -561,13 +568,14 @@ void log_output(log_cb cb_log, bool tag_separate) {
 
 void log_slot(log_level_e level, const char *tag, const char *fmt, va_list params) {
 
-    static __thread char        g_line[LOG_LINE_MAX];
+    static __thread char        g_line[LOG_HDR_RESERVE + 256 + LOG_LINE_MAX];
     static __thread int         g_logging = -1;         // -1: 默认模式，0: 开启缓存模式（缓存内容为空），>0: 缓存模式且已写入内容
 #ifndef LOG_FILE_DISABLED
     static void*                g_cache_head, *g_cache_rear;
     static uint32_t             g_line_count;
     static pthread_mutex_t      g_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 #endif
+    char* const                 buf = g_line + LOG_HDR_RESERVE + 256;     // 日志输出起始位置
 
     // 如果 tag 为空，表示输出日志到缓存
     if (!tag) {
@@ -584,59 +592,102 @@ void log_slot(log_level_e level, const char *tag, const char *fmt, va_list param
         if (g_logging < 0) g_logging = 0;
         if (!*fmt) return;
         if (*fmt == '%' && fmt[1] == ' ') {
-            char* b = g_line + g_logging;
+            char* b = buf + g_logging;
             strncpy(b, fmt + 2, LOG_LINE_MAX - 1 - g_logging); 
-            g_line[LOG_LINE_MAX - 1] = '\0';
+            buf[LOG_LINE_MAX - 1] = '\0';
             g_logging += (int)strlen(b);
         }
-        else g_logging += vsnprintf(g_line + g_logging, LOG_LINE_MAX - g_logging, fmt, params);
+        else g_logging += vsnprintf(buf + g_logging, LOG_LINE_MAX - g_logging, fmt, params);
         return;
     }
 
     // 如果之前开启了缓存模式，且缓存内容为空，则关闭缓存模式，直接返回
-    if (g_logging == 0) {
-        g_logging = -1;
+    if (g_logging == 0) { g_logging = -1;
         return;
     }
 
-    // 输出到 instrument（如果启用）
+    int tag_len = (int)strlen(tag);
+    if (tag_len > 255 + LOG_LINE_MAX - 1)           // 限制 tag 长度，防止溢出
+        tag_len = 255 + LOG_LINE_MAX - 1;
+    char* out;                                      // 输出起始位置
+
+    int n = 0;
+    if (g_logging > 0) {                            // 对于缓存模式的最终输出
+        n = g_logging; g_logging = -1;              // 关闭缓存模式
+    }
+
     #ifdef LOG_INSTRUMENT
-    instrument_slot((uint8_t)level, tag, fmt, params);
+    {
+        // 复制 tag
+        int m = (tag_len < 256) ? tag_len : 255;
+        out = buf - m - 1;
+        memcpy(out, tag, m);
+        out[m] = 0;
+
+        // 格式化文本
+        if (n < LOG_LINE_MAX) {
+            if (*fmt == '%' && fmt[1] == ' ')
+                n += snprintf(buf+n, LOG_LINE_MAX-n, "%s", fmt + 2);
+            else n += vsnprintf(buf+n, LOG_LINE_MAX-n, fmt, params);
+        }
+        if (n >= LOG_LINE_MAX) buf[n = LOG_LINE_MAX - 1] = 0;
+
+        inst_send_buf((uint8_t)level, out - INST_HDR_SIZE, m, n);
+
+        if (g_tag_separate) out = buf; 
+        else {
+            if (tag_len >= 256) { int shift = tag_len - 255;
+                int max_n = LOG_LINE_MAX - 1 - shift;       // 移动后的最大 text 长度 (-1 给 \0)
+                if (max_n < 0) max_n = 0;
+                if (n > max_n) buf[n = max_n] = 0;          // 截断 text
+                memmove(buf + shift, buf, n + 1);           // 后移 text (+1 含 \0)
+                memcpy(buf - 1, tag + 255, shift);          // 填入 tag 剩余部分 (从 out[255] 开始)
+            }
+            out[tag_len] = ' ';
+        }
+    }
+    #else
+    {
+        char* text = buf;                                   // text 起始位置
+        int text_max = LOG_LINE_MAX;                        // text 可用空间
+
+        // 设置输出位置
+        if (g_tag_separate) out = buf;
+        else {
+            int m = (tag_len < 256) ? tag_len : 255;
+            out = buf - m - 1;
+            memcpy(out, tag, m);
+            if (tag_len >= 256) { int shift = tag_len - 255;
+                text_max = LOG_LINE_MAX - 1 - shift;        // 移动后的最大 text 长度 (-1 给 \0)
+                if (text_max < 0) text_max = 0;
+                if (n > text_max) n = text_max;             // 截断缓存
+                if (n > 0) memmove(buf + shift, buf, n);
+                memcpy(buf - 1, tag + 255, shift);          // 填入 tag 剩余部分 (从 out[255] 开始)
+                text = buf + shift;                         // text 起始位置改变
+            }
+            out[tag_len] = ' ';
+        }
+
+        // 格式化 fmt 到 text
+        if (n < text_max) {
+            if (*fmt == '%' && fmt[1] == ' ')
+                n += snprintf(text+n, text_max-n, "%s", fmt + 2);
+            else n += vsnprintf(text+n, text_max-n, fmt, params);
+        }
+        if (text_max > 0 && n >= text_max) text[n = text_max - 1] = 0;
+    }
     #endif
 
-    int n;
-    if (g_logging > 0) {                    // 对于缓存模式的最终输出
-        n = g_logging; g_logging = -1;      // 关闭缓存模式
-        if (n < LOG_LINE_MAX) { 
-            if (*fmt == '%' && fmt[1] == ' ')
-                n += snprintf(g_line+n, sizeof(g_line)-n, "%s", fmt + 2);
-            else n += vsnprintf(g_line+n, sizeof(g_line)-n, fmt, params);
-        }
-    } else if (g_tag_separate) {
-        if (*fmt == '%' && fmt[1] == ' ')
-            n = snprintf(g_line, sizeof(g_line), "%s", fmt + 2);
-        else n = vsnprintf(g_line, sizeof(g_line), fmt, params);
-    } else if (*fmt == '%' && fmt[1] == ' ')  {
-        n = snprintf(g_line, sizeof(g_line), "%s %s", tag, fmt + 2);
-    } else {    
-        n = snprintf(g_line, sizeof(g_line), "%s ", tag);
-        if (n < LOG_LINE_MAX - 1) {
-            n += vsnprintf(g_line + n, LOG_LINE_MAX - n, fmt, params);
-        }
-    }
-
-    if (n >= LOG_LINE_MAX) { n = LOG_LINE_MAX - 1;
-        g_line[n] = 0;
-    }
+    int total = (out == buf) ? n : tag_len + 1 + n;  // 总输出长度
 
     // 对于标准输出
     if (g_cb_log == (log_cb)-1) {
-        if (g_line[--n] == '\n') g_line[n] = 0; // 移除末尾换行符（避免重复添加）
-        printf("%s\n", g_line);                 // 标准输出自动添加换行符
+        if (total > 0 && out[total - 1] == '\n') out[--total] = 0; // 移除末尾换行符
+        printf("%s\n", out);
     }
     // 对于回调（包括系统日志）
     else if (g_cb_log) {
-        g_cb_log(level, g_tag_separate ? tag : NULL, g_line, n);
+        g_cb_log(level, g_tag_separate ? tag : NULL, out, total);
     }
 
 #ifndef LOG_FILE_DISABLED
@@ -666,20 +717,15 @@ void log_slot(log_level_e level, const char *tag, const char *fmt, va_list param
               g_cache_rear = NULL;
               g_line_count = 0;
           }
-          fprintf(fp, "%s %s\n", tag, g_line);
+          fprintf(fp, "%s\n", out);
           fclose(fp);
 
           log_append = true;
       }
       else {
 
-#if LOG_TAG_SEPARATE
-          void** item = (void**)malloc(n + strlen(tag) + 3/* ' ' + \r\0 */ + sizeof(void*)); *item = NULL;
-          sprintf((char*)(item+1), "%s %s\n", tag, g_line);
-#else
-          void** item = (void**)malloc(len + 2/* \r\0 */ + sizeof(void*)); *item = NULL;
-          sprintf((char*)(item+1), "%s\n", g_line);
-#endif
+          void** item = (void**)malloc(total + 2/* \n\0 */ + sizeof(void*)); *item = NULL;
+          sprintf((char*)(item+1), "%s\n", out);
           if (g_cache_rear) *(void**)g_cache_rear = item;
           else g_cache_head = item;
           g_cache_rear = item;
@@ -836,60 +882,70 @@ instrument_enabled(uint16_t idx) {
 
 // ---- 发送端 ----
 
-void
-instrument_slot(uint8_t chn, const char* tag, const char* fmt, va_list params) {
+// 内部函数：发送已格式化的文本
+// buf: 缓冲区，tag + \0 + text 从 buf + INST_HDR_SIZE 开始
+// tag_len: tag 长度（tag 已在 buf + INST_HDR_SIZE，后跟 \0）
+// text_len: text 长度（text 从 tag + tag_len + 1 开始）
+static void
+inst_send_buf(uint8_t chn, char* buf, int tag_len, int text_len) {
 
-    uint8_t pkt[INST_UDP_MAX];
-    const char *txt; int text_len;
-    bool need_format = !(*fmt == '%' && fmt[1] == ' ');
-   
-    // 计算 text 在 pkt 中的偏移位置
-     int tag_len = tag ? (int)strlen(tag) : 0;
-    if (tag_len > 255) tag_len = 255;
-    int text_offset = INST_HDR_SIZE + 1 + 1 + tag_len;  // header + chn + tag_len + tag
-    int text_avail = (int)sizeof(pkt) - text_offset;
+    char* tag  = buf + INST_HDR_SIZE;
+    char* text = tag + tag_len + 1;                 // 跳过 \0
 
-    // 直接格式化到 pkt 的 text 位置（0 拷贝）
-    if (need_format) {
-        txt = (char*)(pkt + text_offset);
-        text_len = vsnprintf((char*)(pkt + text_offset), text_avail, fmt, params);
-        if (text_len < 0) text_len = 0;
-        if (text_len >= text_avail) text_len = text_avail - 1;
-    } else {
-        txt = fmt + 2;
-        text_len = (int)strlen(txt);
-        if (text_len >= text_avail) text_len = text_avail - 1;
-    }
-
-    // 本地回调
+    // 本地回调：tag 已有 \0 结尾，直接使用
     if (g_inst_cb) {
-        g_inst_cb(0, chn, tag, (char*)txt, text_len);
+        g_inst_cb(0, chn, tag, text, text_len);
     }
 
     // 本地模式：不发送网络
     if (g_inst_local) return;
     if (g_inst_sock == P_INVALID_SOCKET && !inst_init()) return;
 
-    // 填充包头
-    nwrite_s(pkt, g_inst_rid);
-    uint16_t seq = g_inst_seq++;
-    nwrite_s(pkt + 2, seq);
+    // 写入固定 header (7 bytes)
+    uint8_t *pkt = (uint8_t*)buf;
+    nwrite_s(pkt, g_inst_rid);                      // rid
+    nwrite_s(pkt + 2, g_inst_seq++);                // seq
     pkt[4] = 0;                                     // type=0 数据包
+    pkt[5] = chn;                                   // chn
+    pkt[6] = (uint8_t)tag_len;                      // tag_len
 
-    // 填充负载头部
-    int n = INST_HDR_SIZE;
-    pkt[n++] = chn;
-    pkt[n++] = (uint8_t)tag_len;
-    if (tag_len > 0) { memcpy(pkt + n, tag, tag_len); n += tag_len; }
-
-    // "% " 格式时 text 不在 pkt 中，需要拷贝；否则已在正确位置
-    if (!need_format) {
-        memcpy(pkt + n, txt, text_len);
-    }
-    n += text_len;
-
-    sendto(g_inst_sock, (const char*)pkt, n, 0,
+    // 协议: header + tag + \0 + text
+    sendto(g_inst_sock, buf, INST_HDR_SIZE + tag_len + 1 + text_len, 0,
            (struct sockaddr*)&g_inst_dest, sizeof(g_inst_dest));
+}
+
+void
+instrument_slot(uint8_t chn, const char* tag, const char* fmt, va_list params) {
+
+    char buf[INST_UDP_MAX];
+
+    // 先计算 tag_len，直接格式化到正确位置，避免 memmove
+    int tag_len = tag ? (int)strlen(tag) : 0;
+    if (tag_len > 255) tag_len = 255;
+
+    char* tag_pos  = buf + INST_HDR_SIZE;
+    char* text_pos = tag_pos + tag_len + 1;         // 跳过 tag + \0
+    int text_max   = INST_PAYLOAD_MAX - tag_len - 1; // 最小 1393-255-1=1137
+    int text_len;
+
+    // "% " 前缀：直接拷贝字符串
+    if (*fmt == '%' && fmt[1] == ' ') { const char *src = fmt + 2;
+        text_len = (int)strlen(src);
+        if (text_len > text_max) text_len = text_max;
+        memcpy(text_pos, src, text_len);
+    }
+    // 格式化到 text 位置
+    else {
+        text_len = vsnprintf(text_pos, text_max, fmt, params);
+        if (text_len < 0) text_len = 0;
+        if (text_len >= text_max) text_len = text_max - 1;
+    }
+
+    // 写入 tag + \0
+    if (tag_len > 0) memcpy(tag_pos, tag, tag_len);
+    tag_pos[tag_len] = '\0';
+
+    inst_send_buf(chn, buf, tag_len, text_len);
 }
 
 // ---- 监听端 ----
@@ -928,19 +984,18 @@ static void inst_handle_bits(uint8_t *payload, int len) {
 }
 
 // 解析并交付一个数据包负载到回调
+// 协议: chn(1) + tag_len(1) + tag + \0 + text
 static void inst_deliver(uint16_t rid, uint8_t *payload, int len) {
-    if (!g_inst_cb || len < 2) return;
+    if (!g_inst_cb || len < 2) return;              // 至少 chn+tag_len
 
     uint8_t chn     = payload[0];
     uint8_t tag_len = payload[1];
-    if (2 + tag_len > len) return;
+    int text_len    = len - 2 - tag_len - 1;        // 从包长计算（-1 是 \0）
 
-    char tag[256];
-    memcpy(tag, payload + 2, tag_len);
-    tag[tag_len] = '\0';
+    if (text_len < 0) return;                       // 数据不完整
 
-    char *text     = (char*)(payload + 2 + tag_len);
-    int   text_len = len - 2 - tag_len;
+    char *tag  = (char*)(payload + 2);              // tag 已有 \0 结尾
+    char *text = tag + tag_len + 1;                 // 跳过 \0
     text[text_len] = '\0';                          // 安全：inst_slot_t.data 有 +1 余量
 
     g_inst_cb(rid, chn, tag, text, text_len);
