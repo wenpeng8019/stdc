@@ -724,7 +724,8 @@ P_net_cleanup();
 
 ```c
 // 消息回调函数类型
-typedef void(*instrument_cb)(uint8_t chn, const char* tag, char *txt, int len);
+typedef void(*instrument_cb)(uint16_t rid, uint8_t chn, const char* tag, char *txt, int len);
+// rid: 发送方随机 ID（本地回调时为 0）
 // chn: 消息通道（传输日志时对应 log_level_e）
 // tag: 消息标签
 // txt: 消息文本（已追加 '\0' 终止符）
@@ -740,6 +741,9 @@ void instrument_port(uint16_t port);
 // 启动监听，按 seq 顺序交付消息到回调
 // 内部处理乱序和丢包，丢包时输出 stderr 警告
 ret_t instrument_listen(instrument_cb cb);
+
+// 设置本地模式（不发送网络广播，只触发本地回调）
+void instrument_local(void);
 
 // 启用/禁用指定选项（通过 UDP 广播同步到所有节点）
 ret_t instrument_enable(uint16_t idx, bool enable);
@@ -769,8 +773,8 @@ void instrument_slot(uint8_t chn, const char* tag, const char* fmt, va_list para
 #include <stdc.h>
 
 // 消息回调
-void on_message(uint8_t chn, const char* tag, char *txt, int len) {
-    printf("[%d] %s: %s\n", chn, tag, txt);
+void on_message(uint16_t rid, uint8_t chn, const char* tag, char *txt, int len) {
+    printf("[rid=%u chn=%d] %s: %s\n", rid, chn, tag, txt);
 }
 
 int main() {
@@ -782,6 +786,9 @@ int main() {
         fprintf(stderr, "监听失败\n");
         return 1;
     }
+    
+    // 可选：设置本地模式（不发送网络广播）
+    // instrument_local();
     
     // 远程控制：启用选项 0
     instrument_enable(0, true);

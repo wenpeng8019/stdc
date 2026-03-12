@@ -333,9 +333,13 @@ instrument_port(1981);
 
 // 监听端：接收并回调处理
 instrument_listen(my_callback);
-void my_callback(uint8_t chn, const char* tag, char *txt, int len) {
+void my_callback(uint16_t rid, uint8_t chn, const char* tag, char *txt, int len) {
+    // rid: 发送方随机 ID（本地回调时为 0）
     printf("[%d] %s: %s\n", chn, tag, txt);
 }
+
+// 本地模式：不发送网络广播，只触发本地回调
+instrument_local();
 
 // 远程选项控制（广播同步到所有节点）
 instrument_enable(0, true);     // 启用选项 0
@@ -399,8 +403,10 @@ P_check(expr, action);          // 运行时断言
 ### 分布式监控 (Instrument)
 - `instrument_port()` - 设置通信端口
 - `instrument_listen()` - 启动监听，按序交付消息
+- `instrument_local()` - 设置本地模式（不发送网络广播）
 - `instrument_enable()` / `instrument_enabled()` - 远程选项控制
 - UDP 广播方式同步，支持乱序处理和丢包检测
+- 回调参数包含发送方 rid（本地回调时为 0）
 - 编译时定义 `LOG_INSTRUMENT` 启用
 
 ### 终端

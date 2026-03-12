@@ -256,12 +256,13 @@ void instrument_port(uint16_t port);
 
 /**
  * @brief                       instrument 消息回调接口定义
+ * @param rid                   发送方节点 ID（本地触发时为 0）
  * @param chn                   消息通道 (当前用于传输日志时对应 log_level_e)
  * @param tag                   消息标签
  * @param txt                   消息文本 (已追加 '\0' 终止符)
  * @param len                   消息文本长度 (不含 '\0')
  */
-typedef void(*instrument_cb)(uint8_t chn, const char* tag, char *txt, int len);
+typedef void(*instrument_cb)(uint16_t rid, uint8_t chn, const char* tag, char *txt, int len);
 
 /**
  * @brief                       发送 instrument 消息包 (内部调用)
@@ -283,6 +284,14 @@ void instrument_slot(uint8_t chn, const char* tag, const char* fmt, va_list para
  *                              丢包时会输出 stderr 警告信息
  */
 ret_t instrument_listen(instrument_cb cb);
+
+/**
+ * @brief                       设置本地模式
+ * @note                        调用后 instrument_slot 不再通过网络广播
+ *                              而是只触发本地 instrument_cb 回调（本地回调的 rid 参数为 0）
+ *                              默认会同时触发本地回调和网络广播
+ */
+void instrument_local(void);
 
 /**
  * @brief                       启用/禁用指定的 instrument 选项

@@ -33,11 +33,13 @@ static uint16_t                 g_inst_seq    = 0;
 typedef struct {
     uint8_t data[INST_UDP_MAX + 1];                  // +1 供交付时追加 '\0'
     int len;                                         // 0 = 空槽
+    uint16_t rid;                                    // 发送方 rid
 } inst_slot_t;
 static instrument_cb            g_inst_cb     = NULL;
 static inst_slot_t              g_inst_win[INST_WINDOW_SIZE];
 static uint16_t                 g_inst_next   = 0;                  // 下一个期望 seq
 static bool                     g_inst_synced = false;              // 首包同步标记
+static bool                     g_inst_local  = false;              // 本地模式标志
 
 // 选项 bitset
 static uint8_t*                 g_inst_bits     = NULL;             // 动态分配
@@ -837,34 +839,53 @@ instrument_enabled(uint16_t idx) {
 void
 instrument_slot(uint8_t chn, const char* tag, const char* fmt, va_list params) {
 
+    uint8_t pkt[INST_UDP_MAX];
+    const char *txt; int text_len;
+    bool need_format = !(*fmt == '%' && fmt[1] == ' ');
+   
+    // 计算 text 在 pkt 中的偏移位置
+     int tag_len = tag ? (int)strlen(tag) : 0;
+    if (tag_len > 255) tag_len = 255;
+    int text_offset = INST_HDR_SIZE + 1 + 1 + tag_len;  // header + chn + tag_len + tag
+    int text_avail = (int)sizeof(pkt) - text_offset;
+
+    // 直接格式化到 pkt 的 text 位置（0 拷贝）
+    if (need_format) {
+        txt = (char*)(pkt + text_offset);
+        text_len = vsnprintf((char*)(pkt + text_offset), text_avail, fmt, params);
+        if (text_len < 0) text_len = 0;
+        if (text_len >= text_avail) text_len = text_avail - 1;
+    } else {
+        txt = fmt + 2;
+        text_len = (int)strlen(txt);
+        if (text_len >= text_avail) text_len = text_avail - 1;
+    }
+
+    // 本地回调
+    if (g_inst_cb) {
+        g_inst_cb(0, chn, tag, (char*)txt, text_len);
+    }
+
+    // 本地模式：不发送网络
+    if (g_inst_local) return;
     if (g_inst_sock == P_INVALID_SOCKET && !inst_init()) return;
 
-    uint8_t pkt[INST_UDP_MAX];
-    int n = INST_HDR_SIZE;
-
-    // 包头: rid(2) + seq(2, big-endian) + type(1)
+    // 填充包头
     nwrite_s(pkt, g_inst_rid);
     uint16_t seq = g_inst_seq++;
     nwrite_s(pkt + 2, seq);
     pkt[4] = 0;                                     // type=0 数据包
 
-    // 负载: chn(1) + tag_len(1) + tag(N) + text(M)
+    // 填充负载头部
+    int n = INST_HDR_SIZE;
     pkt[n++] = chn;
-    int tag_len = tag ? (int)strlen(tag) : 0;
-    if (tag_len > 255) tag_len = 255;
     pkt[n++] = (uint8_t)tag_len;
     if (tag_len > 0) { memcpy(pkt + n, tag, tag_len); n += tag_len; }
 
-    int avail = (int)sizeof(pkt) - n;
-    if (avail <= 0) return;
-
-    int text_len;
-    if (*fmt == '%' && fmt[1] == ' ')
-        text_len = snprintf((char*)(pkt + n), avail, "%s", fmt + 2);
-    else
-        text_len = vsnprintf((char*)(pkt + n), avail, fmt, params);
-    if (text_len < 0) text_len = 0;
-    if (text_len >= avail) text_len = avail - 1;
+    // "% " 格式时 text 不在 pkt 中，需要拷贝；否则已在正确位置
+    if (!need_format) {
+        memcpy(pkt + n, txt, text_len);
+    }
     n += text_len;
 
     sendto(g_inst_sock, (const char*)pkt, n, 0,
@@ -886,6 +907,11 @@ instrument_listen(instrument_cb cb) {
     return E_NONE;
 }
 
+void
+instrument_local(void) {
+    g_inst_local = true;
+}
+
 // ---- 监听端 ----
 
 // 处理 type=1 选项包
@@ -902,7 +928,7 @@ static void inst_handle_bits(uint8_t *payload, int len) {
 }
 
 // 解析并交付一个数据包负载到回调
-static void inst_deliver(uint8_t *payload, int len) {
+static void inst_deliver(uint16_t rid, uint8_t *payload, int len) {
     if (!g_inst_cb || len < 2) return;
 
     uint8_t chn     = payload[0];
@@ -917,7 +943,7 @@ static void inst_deliver(uint8_t *payload, int len) {
     int   text_len = len - 2 - tag_len;
     text[text_len] = '\0';                          // 安全：inst_slot_t.data 有 +1 余量
 
-    g_inst_cb(chn, tag, text, text_len);
+    g_inst_cb(rid, chn, tag, text, text_len);
 }
 
 // 从 g_inst_next 开始连续交付已缓冲的包
@@ -929,8 +955,9 @@ static int inst_flush(void) {
 
         uint8_t *pkt = g_inst_win[idx].data;
         int pkt_len  = g_inst_win[idx].len;
+        uint16_t rid = g_inst_win[idx].rid;
         if (pkt_len > INST_HDR_SIZE)
-            inst_deliver(pkt + INST_HDR_SIZE, pkt_len - INST_HDR_SIZE);
+            inst_deliver(rid, pkt + INST_HDR_SIZE, pkt_len - INST_HDR_SIZE);
 
         g_inst_win[idx].len = 0;
         g_inst_next++;
@@ -975,12 +1002,13 @@ static int32_t inst_thread_proc(void *ctx) {
         if (diff >= INST_WINDOW_SIZE) {
             fprintf(stderr, "inst: lost %d packets (seq %u → %u)\n", (int)diff, g_inst_next, seq);
             for (int i = 0; i < INST_WINDOW_SIZE; i++) {
-                int idx = (g_inst_next + i) & INST_WINDOW_MASK;
-                if (g_inst_win[idx].len > 0) {
-                    if (g_inst_win[idx].len > INST_HDR_SIZE)
-                        inst_deliver(g_inst_win[idx].data + INST_HDR_SIZE,
-                                     g_inst_win[idx].len  - INST_HDR_SIZE);
-                    g_inst_win[idx].len = 0;
+                int slot_idx = (g_inst_next + i) & INST_WINDOW_MASK;
+                if (g_inst_win[slot_idx].len > 0) {
+                    if (g_inst_win[slot_idx].len > INST_HDR_SIZE)
+                        inst_deliver(g_inst_win[slot_idx].rid,
+                                     g_inst_win[slot_idx].data + INST_HDR_SIZE,
+                                     g_inst_win[slot_idx].len  - INST_HDR_SIZE);
+                    g_inst_win[slot_idx].len = 0;
                 }
             }
             g_inst_next = seq;
@@ -992,6 +1020,7 @@ static int32_t inst_thread_proc(void *ctx) {
         if (g_inst_win[idx].len == 0) {
             memcpy(g_inst_win[idx].data, buf, n);
             g_inst_win[idx].len = n;
+            g_inst_win[idx].rid = rid;
         }
 
         // 顺序交付
