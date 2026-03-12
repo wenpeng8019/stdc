@@ -36,10 +36,12 @@ typedef struct {
     uint16_t rid;                                    // 发送方 rid
 } inst_slot_t;
 static instrument_cb            g_inst_cb     = NULL;
+static TLS int                  g_inst_in_cb  = 0;                  // 防止回调递归
 static inst_slot_t              g_inst_win[INST_WINDOW_SIZE];
 static uint16_t                 g_inst_next   = 0;                  // 下一个期望 seq
 static bool                     g_inst_synced = false;              // 首包同步标记
 static bool                     g_inst_local  = false;              // 本地模式标志
+
 
 // 选项 bitset
 static uint8_t*                 g_inst_bits     = NULL;             // 动态分配
@@ -893,8 +895,11 @@ inst_send_buf(uint8_t chn, char* buf, int tag_len, int text_len) {
     char* text = tag + tag_len + 1;                 // 跳过 \0
 
     // 本地回调：tag 已有 \0 结尾，直接使用
-    if (g_inst_cb) {
+    // 递归保护：防止回调中调用 print() 导致无限递归
+    if (g_inst_cb && !g_inst_in_cb) {
+        g_inst_in_cb = 1;
         g_inst_cb(0, chn, tag, text, text_len);
+        g_inst_in_cb = 0;
     }
 
     // 本地模式：不发送网络
