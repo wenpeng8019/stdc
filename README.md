@@ -308,20 +308,38 @@ P_thd_id();                     // 当前线程 ID
 P_net_init();                   // 初始化（Windows WSAStartup）
 
 sock_t sock = socket(...);
-P_set_nonblock(sock, true);     // 非阻塞模式
-P_set_reuseaddr(sock, true);    // SO_REUSEADDR
-P_set_nodelay(sock, true);      // TCP_NODELAY
-P_set_keepalive(sock, true);    // SO_KEEPALIVE
-P_set_sndtimeo(sock, 1000);     // 发送超时（毫秒）
-P_set_rcvtimeo(sock, 1000);     // 接收超时（毫秒）
+P_sock_nonblock(sock, true);    // 非阻塞模式
+P_sock_reuseaddr(sock, true);   // SO_REUSEADDR
+P_sock_nodelay(sock, true);     // TCP_NODELAY
+P_sock_keepalive(sock, true);   // SO_KEEPALIVE
+P_sock_sndtimeo(sock, 1000);    // 发送超时（毫秒）
+P_sock_rcvtimeo(sock, 1000);    // 接收超时（毫秒）
 
 P_inet_pton(AF_INET, "127.0.0.1", &addr);
 P_inet_ntop(AF_INET, &addr, buf, sizeof(buf));
 
-P_net_errno();                  // 获取网络错误码
-P_net_errno_is_inprogress();    // 是否为 EINPROGRESS
-P_net_close(sock);
+P_sock_errno();                 // 获取网络错误码
+P_sock_is_inprogress();         // 是否为 EINPROGRESS
+P_sock_close(sock);
 P_net_cleanup();
+```
+
+### 分布式监控 (Instrument)
+```c
+// 编译时定义 LOG_INSTRUMENT 启用
+
+// 设置通信端口（可选，默认 1980）
+instrument_port(1981);
+
+// 监听端：接收并回调处理
+instrument_listen(my_callback);
+void my_callback(uint8_t chn, const char* tag, char *txt, int len) {
+    printf("[%d] %s: %s\n", chn, tag, txt);
+}
+
+// 远程选项控制（广播同步到所有节点）
+instrument_enable(0, true);     // 启用选项 0
+instrument_enabled(0);          // 查询选项 0 是否启用
 ```
 
 ### 终端操作
@@ -374,9 +392,16 @@ P_check(expr, action);          // 运行时断言
 
 ### 网络
 - `P_net_init()` / `P_net_cleanup()`
-- `P_set_nonblock()` - 设置非阻塞
-- `P_set_reuseaddr()` / `P_set_nodelay()` - Socket 选项
+- `P_sock_nonblock()` - 设置非阻塞
+- `P_sock_reuseaddr()` / `P_sock_nodelay()` - Socket 选项
 - `P_inet_pton()` / `P_inet_ntop()` - 地址转换
+
+### 分布式监控 (Instrument)
+- `instrument_port()` - 设置通信端口
+- `instrument_listen()` - 启动监听，按序交付消息
+- `instrument_enable()` / `instrument_enabled()` - 远程选项控制
+- UDP 广播方式同步，支持乱序处理和丢包检测
+- 编译时定义 `LOG_INSTRUMENT` 启用
 
 ### 终端
 - `P_isatty()` - 检测是否为终端

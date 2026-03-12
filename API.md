@@ -15,6 +15,7 @@ stdc 跨平台 C 库完整 API 文档。
 - [原子操作](#原子操作)
 - [线程与同步](#线程与同步)
 - [网络编程](#网络编程)
+- [分布式监控](#分布式监控)
 - [终端操作](#终端操作)
 
 ---
@@ -245,6 +246,11 @@ ret_t P_cost_now(P_clock* clock, bool bProcessOrThread);
 
 // 睡眠（微秒）
 void P_usleep(uint64_t us);
+
+// 快捷时间戳函数（基于单调时钟）
+uint64_t P_tick_s(void);    // 返回秒
+uint64_t P_tick_ms(void);   // 返回毫秒
+uint64_t P_tick_us(void);   // 返回微秒
 ```
 
 ### 示例
@@ -597,47 +603,76 @@ typedef socklen_t;     // Socket 地址长度类型
 
 ```c
 // 关闭 socket
-ret_t P_net_close(sock_t s);
+ret_t P_sock_close(sock_t s);
 
 // 获取最后的网络错误
-int P_net_errno(void);
+int P_sock_errno(void);
 
-// 检查错误是否为 EINPROGRESS/EWOULDBLOCK
-bool P_net_errno_is_inprogress(void);
+// 检查错误是否为 EINPROGRESS（非阻塞连接进行中）
+bool P_sock_is_inprogress(void);
 
-// 检查错误是否为连接重置
-bool P_net_errno_is_connreset(void);
+// 检查错误是否为 EWOULDBLOCK（暂无数据/缓冲区满）
+bool P_sock_is_wouldblock(void);
+
+// 检查错误是否为 ECONNRESET（连接已重置）
+bool P_sock_is_connreset(void);
+
+// 检查错误是否为 EINTR（被信号中断）
+bool P_sock_is_interrupted(void);
 ```
 
 ### Socket 选项
 
 ```c
 // 设置非阻塞模式
-ret_t P_set_nonblock(sock_t s, bool enable);
+ret_t P_sock_nonblock(sock_t s, bool enable);
 
 // 设置 SO_REUSEADDR
-ret_t P_set_reuseaddr(sock_t s, bool enable);
+ret_t P_sock_reuseaddr(sock_t s, bool enable);
 
 // 设置 SO_REUSEPORT（并非所有平台都支持）
-ret_t P_set_reuseport(sock_t s, bool enable);
+ret_t P_sock_reuseport(sock_t s, bool enable);
 
 // 设置 TCP_NODELAY（禁用 Nagle 算法）
-ret_t P_set_nodelay(sock_t s, bool enable);
+ret_t P_sock_nodelay(sock_t s, bool enable);
 
 // 设置 SO_KEEPALIVE
-ret_t P_set_keepalive(sock_t s, bool enable);
+ret_t P_sock_keepalive(sock_t s, bool enable);
 
 // 设置发送超时（毫秒）
-ret_t P_set_sndtimeo(sock_t s, int ms);
+ret_t P_sock_sndtimeo(sock_t s, int ms);
 
 // 设置接收超时（毫秒）
-ret_t P_set_rcvtimeo(sock_t s, int ms);
+ret_t P_sock_rcvtimeo(sock_t s, int ms);
 
 // 设置发送缓冲区大小
-ret_t P_set_sndbuf(sock_t s, int size);
+ret_t P_sock_sndbuf(sock_t s, int size);
 
 // 设置接收缓冲区大小
-ret_t P_set_rcvbuf(sock_t s, int size);
+ret_t P_sock_rcvbuf(sock_t s, int size);
+```
+
+### 网络字节序
+
+```c
+// 64 位主机/网络字节序转换
+uint64_t htonll(uint64_t x);
+uint64_t ntohll(uint64_t x);
+
+// 从字节流读取网络字节序数值
+uint16_t nget_s(uint8_t* bytes);   // 读取 2 字节 (short)
+uint32_t nget_l(uint8_t* bytes);   // 读取 4 字节 (long)
+uint64_t nget_ll(uint8_t* bytes);  // 读取 8 字节 (long long)
+
+// 向字节流写入网络字节序数值
+void nwrite_s(uint8_t* bytes, uint16_t value);
+void nwrite_l(uint8_t* bytes, uint32_t value);
+void nwrite_ll(uint8_t* bytes, uint64_t value);
+
+// 通过指针读取网络字节序数值
+void nread_s(uint16_t* result, uint8_t* bytes);
+void nread_l(uint32_t* result, uint8_t* bytes);
+void nread_ll(uint64_t* result, uint8_t* bytes);
 ```
 
 ### 地址转换
@@ -656,9 +691,9 @@ const char* P_inet_ntop(int af, const void* src, char* dst, socklen_t size);
 P_net_init();
 
 sock_t sock = socket(AF_INET, SOCK_STREAM, 0);
-P_set_nonblock(sock, true);
-P_set_reuseaddr(sock, true);
-P_set_nodelay(sock, true);
+P_sock_nonblock(sock, true);
+P_sock_reuseaddr(sock, true);
+P_sock_nodelay(sock, true);
 
 struct sockaddr_in addr;
 addr.sin_family = AF_INET;
@@ -667,8 +702,102 @@ P_inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
 
 // ... 使用 socket ...
 
-P_net_close(sock);
+P_sock_close(sock);
 P_net_cleanup();
+```
+
+---
+
+## 分布式监控
+
+基于 UDP 广播的分布式调试监控系统，支持多节点日志汇聚、乱序处理和远程选项控制。
+
+> **注意**：需要在编译时定义 `LOG_INSTRUMENT` 宏启用此功能。
+
+### 配置宏
+
+| 宏 | 默认值 | 说明 |
+|-------|---------|-------------|
+| `INSTRUMENT_PORT` | 1980 | 默认通信端口 |
+
+### 类型
+
+```c
+// 消息回调函数类型
+typedef void(*instrument_cb)(uint8_t chn, const char* tag, char *txt, int len);
+// chn: 消息通道（传输日志时对应 log_level_e）
+// tag: 消息标签
+// txt: 消息文本（已追加 '\0' 终止符）
+// len: 消息文本长度（不含 '\0'）
+```
+
+### 函数
+
+```c
+// 设置通信端口（必须在首次调用其他 instrument_* 函数之前）
+void instrument_port(uint16_t port);
+
+// 启动监听，按 seq 顺序交付消息到回调
+// 内部处理乱序和丢包，丢包时输出 stderr 警告
+ret_t instrument_listen(instrument_cb cb);
+
+// 启用/禁用指定选项（通过 UDP 广播同步到所有节点）
+ret_t instrument_enable(uint16_t idx, bool enable);
+
+// 查询指定选项是否启用
+bool instrument_enabled(uint16_t idx);
+
+// 发送消息包（内部调用，通常由日志系统自动触发）
+void instrument_slot(uint8_t chn, const char* tag, const char* fmt, va_list params);
+```
+
+### 协议说明
+
+- **传输方式**：UDP 广播，支持局域网内多节点通信
+- **包格式**：`rid(2) + seq(2) + type(1) + payload`
+  - `rid`: 节点随机 ID，用于过滤自己的包
+  - `seq`: 序列号，用于顺序交付
+  - `type`: 包类型（0=数据包，1=选项包）
+- **窗口大小**：64，超出窗口时强制交付并报告丢包
+- **MTU**：1400 字节（保守值，适应大多数网络环境）
+
+### 示例
+
+```c
+// 定义编译宏
+#define LOG_INSTRUMENT
+#include <stdc.h>
+
+// 消息回调
+void on_message(uint8_t chn, const char* tag, char *txt, int len) {
+    printf("[%d] %s: %s\n", chn, tag, txt);
+}
+
+int main() {
+    // 可选：设置自定义端口
+    instrument_port(1981);
+    
+    // 启动监听
+    if (instrument_listen(on_message) != E_NONE) {
+        fprintf(stderr, "监听失败\n");
+        return 1;
+    }
+    
+    // 远程控制：启用选项 0
+    instrument_enable(0, true);
+    
+    // 查询选项状态
+    if (instrument_enabled(0)) {
+        print("I: 选项 0 已启用\n");
+    }
+    
+    // 日志会自动通过 instrument 发送到所有监听节点
+    print("I: 服务器启动\n");
+    
+    // ... 主循环 ...
+    
+    return 0;
+}
 ```
 
 ---

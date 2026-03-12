@@ -167,6 +167,10 @@ typedef union {
 
 ///////////////////////////////////////////////////////////////////////////////
 
+#ifndef NDEBUG
+#define LOG_INSTRUMENT
+#endif
+
 #ifndef ROOT_TAG
 #define ROOT_TAG            ""                      /* 必须是预定义常量字符串 */
 #endif
@@ -179,7 +183,7 @@ typedef union {
 #endif
 
 #ifndef LOG_TAG_MAX
-#define LOG_TAG_MAX         (-24)                   /* tag 格式化布局，abs 大小为 tag 宽度
+#define LOG_TAG_MAX         (-24)                   /* tag 格式化布局, abs 大小为 tag 宽度
                                                      * >0: 固定宽度，左对齐, 右侧补空格;
                                                      * <0: 固定宽度，右对齐, 左侧补空格;
                                                      * =0: 非固定宽度输出, tag 最大 128 字符 */
@@ -221,8 +225,83 @@ typedef void(*log_cb)(log_level_e level, const char* tag, char *txt, int len);
 void
 log_output(log_cb cb_log, bool tag_separate);
 
+/**
+ * @brief 日志输出
+ *        该操作的主要场景是被 print() 自动调用。应用层应该首选 print()，而不是直接调用 log_slot()
+ *        该操作的内部会自动根据不同平台、或配置来选择目标输出（stdout、系统日志、自定义回调、或文件）
+ * @param level 日志级别
+ * @param tag 日志标签（模块名、文件名等）
+ * @param fmt 格式字符串（支持 printf 风格）
+ * @note  这里的 fmt 支持一个特殊用法：
+ *        即如果 fmt 以 '% ' 开头，即 '%' + 空格，则视为 fmt 是一个非格式化字符串
+ *        此时会直接将 fmt 中的内容原样输出，相当于 printf("%s", fmt + 2)
+ * @param ... 可变参数
+ */
 void
 log_slot(log_level_e level, const char* tag, const char* fmt, va_list params);
+
+#ifdef LOG_INSTRUMENT
+
+#ifndef INSTRUMENT_PORT
+#define INSTRUMENT_PORT      1980
+#endif
+
+/**
+ * @brief                       设置 instrument 通信端口
+ * @param port                  UDP 端口号
+ * @note                        必须在首次调用其他 instrument_* 函数之前调用
+ *                              不执行该操作，则默认端口为 INSTRUMENT_PORT (1980)
+ */
+void instrument_port(uint16_t port);
+
+/**
+ * @brief                       instrument 消息回调接口定义
+ * @param chn                   消息通道 (当前用于传输日志时对应 log_level_e)
+ * @param tag                   消息标签
+ * @param txt                   消息文本 (已追加 '\0' 终止符)
+ * @param len                   消息文本长度 (不含 '\0')
+ */
+typedef void(*instrument_cb)(uint8_t chn, const char* tag, char *txt, int len);
+
+/**
+ * @brief                       发送 instrument 消息包 (内部调用)
+ * @param chn                   消息通道
+ * @param tag                   消息标签
+ * @param fmt                   格式化字符串
+ * @param params                可变参数列表
+ * @note                        以 UDP 广播方式发送到局域网
+ *                              首次调用时自动初始化 socket，进程退出时自动关闭
+ */
+void instrument_slot(uint8_t chn, const char* tag, const char* fmt, va_list params);
+
+/**
+ * @brief                       启动 instrument 监听
+ * @param cb                    消息回调函数，按 seq 顺序交付
+ * @return                      E_NONE 成功，否则返回错误码
+ * @note                        内部启动接收线程，处理乱序和丢包
+ *                              同时初始化发送端 socket（监听端也可发送）
+ *                              丢包时会输出 stderr 警告信息
+ */
+ret_t instrument_listen(instrument_cb cb);
+
+/**
+ * @brief                       启用/禁用指定的 instrument 选项
+ * @param idx                   选项索引 (0-based)
+ * @param enable                true=启用, false=禁用
+ * @return                      E_NONE 成功，否则返回错误码
+ * @note                        选项状态通过 UDP 广播同步到所有节点
+ *                              可用于远程控制功能开关
+ */
+ret_t instrument_enable(uint16_t idx, bool enable);
+
+/**
+ * @brief                       查询指定 instrument 选项是否启用
+ * @param idx                   选项索引 (0-based)
+ * @return                      true=已启用, false=未启用或索引越界
+ */
+bool instrument_enabled(uint16_t idx);
+
+#endif
 
 static inline void print(const char* fmt, ...) {
 
@@ -275,19 +354,19 @@ static inline void print(const char* fmt, ...) {
     // DEBUG 模式下，fmt 为空作为一种标识，即将文件名和行号作为 tag 输出，同时将 ... 中的第一个参数作为 fmt
     va_list args; va_start(args, fmt);
     const char* tag = s_tag;
-    log_level_e level = LOG_DEF;
+    uint8_t chn = (uint8_t)LOG_DEF;
     static TLS char s_file[256];
     if (!fmt || !*fmt) {
         snprintf(tag = s_file, sizeof(s_file), "%s:%d", va_arg(args, const char*), va_arg(args, int));
         fmt = va_arg(args, const char*);
-        level = LOG_SLOT_DEBUG;
+        chn = (uint8_t)LOG_SLOT_DEBUG;
     }
 #else
     // RELEASE 模式下，会忽略这一形式的输出
     if (!fmt || !*fmt) return;
     va_list args; va_start(args, fmt);
     const char* tag = s_tag;
-    log_level_e level = LOG_DEF;
+    uint8_t chn = (uint8_t)LOG_DEF;
 #endif
 
     static TLS bool s_begin = false;
@@ -296,45 +375,58 @@ static inline void print(const char* fmt, ...) {
         // 如果以双 ':' 开头，则在调整状态下，直接输出到标准输出
         if (*++fmt == ':') {
 #ifndef NDEBUG
-            fmt += fmt[1] == ' ' ? 2 : 1;
-            // 如果 fmt 为空，则 ... 中的第一个参数作为 fmt，即允许 print("::", fmt) 形式的调用
-            if (!*fmt) fmt = va_arg(args, const char*);
+            fmt += fmt[1] == ' ' ? 2 : 1;               // 忽略 1 个且只忽略 1 个空格（即允许多个空格作为缩进）
+            if (!*fmt) fmt = va_arg(args, const char*); // 支持 print("I:", fmt, ...) 形式的调用
             vprintf(fmt, args);
 #endif
             va_end(args);
             return;
         }
-        // 否则如果以单 ':' 开头，开启缓存模式。此外，如果之前已经开启缓存，则清空缓存，从头开始
-        s_begin = true;
-        // 如果 fmt 为空，则 ... 中的第一个参数作为 fmt，即允许 print(":", fmt) 形式的调用
-        if (!*fmt) fmt = va_arg(args, const char*);
-        log_slot(LOG_SLOT_NONE, NULL, fmt, args);
+        // 否则如果以单 ':' 开头，则开启缓存模式
+        // + 注意，换成模式不支持 print(":", fmt, ...) 形式的调用
+        //   因为 print(":") 被视为只开启缓存模式，但不输出任何内容
+
+        if (s_begin) log_slot(LOG_SLOT_NONE, NULL, NULL, args); // 如果之前已经开启缓存，则清空缓存，从头开始
+        else { s_begin = true;
+            if (*fmt == ' ') ++fmt;                     // 忽略 1 个且只忽略 1 个空格（即允许多个空格作为缩进）
+            log_slot(LOG_SLOT_NONE, NULL, fmt, args);
+        }
         va_end(args);
         return;
     }
 
     if (fmt[1] == ':') {
+        s_begin = false;                                // 只要指定 chn 标识，就会关闭缓存模式
         const char *q="VDIWEF", *p = strchr(q, *fmt);
-        if (p) { s_begin = false;                           // 只要指定 level 标识，就会关闭缓存模式
-            level = (log_level_e)(p - q); fmt+=2;
-            if (*fmt == ' ') ++fmt;                         // 忽略 1 个且只忽略 1 个空格（即允许多个空格作为缩进）
-            // 如果 fmt 为空，则 ... 中的第一个参数作为 fmt，即允许 print("E:", fmt) 形式的调用
-            if (!*fmt) fmt = va_arg(args, const char*);
+        if (p) { chn = (uint8_t)(p - q); 
+            fmt+=2; if (*fmt == ' ') ++fmt;             // 忽略 1 个且只忽略 1 个空格（即允许多个空格作为缩进）
+            if (!*fmt) fmt = va_arg(args, const char*); // 支持 print("I:", fmt, ...) 形式的调用
+        }
+        else {
+#ifdef LOG_INSTRUMENT            
+            fmt+=2; if (*fmt == ' ') ++fmt;
+            if (!*fmt) fmt = va_arg(args, const char*); // 支持 print("E:", fmt, ...) 形式的调用
+            instrument_slot(*fmt, tag, fmt, args);      // 如果指定的 chn 不合法，则视为 instrument 输出
+#endif
+            va_end (args);
+            return;
         }
     }
 
     if (s_begin)
         log_slot(LOG_SLOT_NONE, NULL, fmt, args);
-    else if (level < LOG_SLOT_NONE)                         // 默认级别为 NONE 时，则默认不输出任何内容
-        log_slot(level, tag, fmt, args);
+    else if (chn < LOG_SLOT_NONE)                       // 默认级别为 NONE 时，则默认不输出任何内容
+        log_slot(chn, tag, fmt, args);
 
     va_end (args);
 }
 
 #ifndef NDEBUG
-#define printf(...)  print(NULL, __FILE_NAME__, __LINE__, __VA_ARGS__)
+#define printf(...)     print(NULL, __FILE_NAME__, __LINE__, __VA_ARGS__)
+#define instrument      print
 #else
-#define printf(...)  ((void)0)
+#define printf(...)     ((void)0)
+#define instrument()    ((void)0)
 #endif
 
 ///////////////////////////////////////////////////////////////////////////////
