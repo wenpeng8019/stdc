@@ -272,6 +272,7 @@ static inline void print(const char* fmt, ...) {
     }
 
 #ifndef NDEBUG
+    // DEBUG 模式下，fmt 为空作为一种标识，即将文件名和行号作为 tag 输出，同时将 ... 中的第一个参数作为 fmt
     va_list args; va_start(args, fmt);
     const char* tag = s_tag;
     log_level_e level = LOG_DEF;
@@ -282,6 +283,7 @@ static inline void print(const char* fmt, ...) {
         level = LOG_SLOT_DEBUG;
     }
 #else
+    // RELEASE 模式下，会忽略这一形式的输出
     if (!fmt || !*fmt) return;
     va_list args; va_start(args, fmt);
     const char* tag = s_tag;
@@ -1905,6 +1907,15 @@ static inline bool P_sock_is_inprogress(void) {
     return err == WSAEWOULDBLOCK || err == WSAEINPROGRESS;
 #else
     return errno == EINPROGRESS || errno == EWOULDBLOCK;
+#endif
+}
+
+// 检查错误是否为"暂无数据/缓冲区满"（非阻塞 I/O）
+static inline bool P_sock_is_wouldblock(void) {
+#if P_WIN
+    return WSAGetLastError() == WSAEWOULDBLOCK;
+#else
+    return errno == EAGAIN || errno == EWOULDBLOCK;
 #endif
 }
 
