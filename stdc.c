@@ -4,6 +4,8 @@
 
 #include "stdc.h"
 
+lang_cb                         P_lang;
+
 static log_cb                   g_cb_log = (log_cb)-1;              // 默认 (-1) stdout 输出
 static bool                     g_tag_separate = false;
 static char                     g_log_name[64] = {0};               // 日志名称（从可执行文件名提取）
@@ -353,7 +355,7 @@ int ARGS_print(const char* arg0) {
                 case ARG_LS:    type_str = "<list>"; break;
             }
             printf("  -%c, --%-*s  %-10s %s%s\n", def->s, max_l_len, def->l, type_str,
-                   def->req ? "\033[31m[required]\033[0m " : "[optional] ", def->desc);
+                   def->req ? "\033[31m[required]\033[0m " : "[optional] ", P_LA(def->desc));
         }
     }
 

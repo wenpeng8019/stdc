@@ -167,9 +167,19 @@ typedef union {
 }                               var_t;
 
 // 使用 P_xxx 操作有利于 hook 操作，后续可替换为自定义内存分配器
+#ifndef P_alloc
 #define P_alloc(size)           malloc(size)
+#endif
+#ifndef P_realloc
 #define P_realloc(ptr, size)    realloc(ptr, size)
+#endif
+#ifndef P_free
 #define P_free(ptr)             free(ptr)
+#endif
+
+typedef const char*(*lang_cb)(const char* cstr);
+extern lang_cb                  P_lang;
+#define P_LA(cstr)              (P_lang ? P_lang(cstr) : (cstr))
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -550,12 +560,26 @@ static arg_def_st ARGS_DEF_##name = {                   \
     #name, desc, ARG_##type, s_cmd, l_cmd, req,         \
     &ARGS_##name, NULL                                  \
 }
-#define ARGS_B(req, name, s_cmd, l_cmd, desc)    ARGS_DEF(req, name, BOOL, s_cmd, l_cmd, desc)
-#define ARGS_I(req, name, s_cmd, l_cmd, desc)    ARGS_DEF(req, name, INT, s_cmd, l_cmd, desc)
-#define ARGS_F(req, name, s_cmd, l_cmd, desc)    ARGS_DEF(req, name, FLOAT, s_cmd, l_cmd, desc)
-#define ARGS_S(req, name, s_cmd, l_cmd, desc)    ARGS_DEF(req, name, STR, s_cmd, l_cmd, desc)
-#define ARGS_D(req, name, s_cmd, l_cmd, desc)    ARGS_DEF(req, name, DIR, s_cmd, l_cmd, desc)
-#define ARGS_L(req, name, s_cmd, l_cmd, desc)    ARGS_DEF(req, name, LS, s_cmd, l_cmd, desc)
+#define ARGS_B(req, name, s_cmd, l_cmd, desc)   ARGS_DEF(req, name, BOOL, s_cmd, l_cmd, desc)
+#define ARGS_I(req, name, s_cmd, l_cmd, desc)   ARGS_DEF(req, name, INT, s_cmd, l_cmd, desc)
+#define ARGS_F(req, name, s_cmd, l_cmd, desc)   ARGS_DEF(req, name, FLOAT, s_cmd, l_cmd, desc)
+#define ARGS_S(req, name, s_cmd, l_cmd, desc)   ARGS_DEF(req, name, STR, s_cmd, l_cmd, desc)
+#define ARGS_D(req, name, s_cmd, l_cmd, desc)   ARGS_DEF(req, name, DIR, s_cmd, l_cmd, desc)
+#define ARGS_L(req, name, s_cmd, l_cmd, desc)   ARGS_DEF(req, name, LS, s_cmd, l_cmd, desc)
+
+#define ARGS_DFT(init, name, type, s_cmd, l_cmd, desc)  \
+extern arg_var_st ARGS_##name;                          \
+arg_var_st ARGS_##name = init;                          \
+static arg_def_st ARGS_DEF_##name = {                   \
+    #name, desc, ARG_##type, s_cmd, l_cmd, false,       \
+    &ARGS_##name, NULL                                  \
+}
+#define ARGS_Bv(dft, name, s_cmd, l_cmd, desc)  ARGS_DFT({.i64=(dft)}, name, BOOL, s_cmd, l_cmd, desc)
+#define ARGS_Iv(dft, name, s_cmd, l_cmd, desc)  ARGS_DFT({.i64=(dft)}, name, INT, s_cmd, l_cmd, desc)
+#define ARGS_Fv(dft, name, s_cmd, l_cmd, desc)  ARGS_DFT({.f64=(dft)}, name, FLOAT, s_cmd, l_cmd, desc)
+#define ARGS_Sv(dft, name, s_cmd, l_cmd, desc)  ARGS_DFT({.str=(dft)}, name, STR, s_cmd, l_cmd, desc)
+#define ARGS_Dv(dft, name, s_cmd, l_cmd, desc)  ARGS_DFT({.str=(dft)}, name, DIR, s_cmd, l_cmd, desc)
+#define ARGS_Lv(dft, name, s_cmd, l_cmd, desc)  ARGS_DFT({.ls=(dft)}, name, LS, s_cmd, l_cmd, desc)
 
 #define ARGS(name) extern arg_var_st ARGS_##name
 
