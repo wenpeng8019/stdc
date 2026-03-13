@@ -48,7 +48,7 @@ typedef enum {
     INST_MODE_REMOTE = 2,   // 本地回调 + 局域网广播
 } inst_mode_e;
 static inst_mode_e              g_inst_mode   = INST_MODE_HOST;     // 默认主机模式
-
+static uint32_t                 g_inst_keep_chn[8] = {0};           // 保留通道 bitset (256位)
 
 // 选项 bitset
 static uint8_t*                 g_inst_bits     = NULL;             // 动态分配
@@ -911,8 +911,10 @@ inst_send_buf(uint8_t chn, char* buf, int tag_len, int text_len) {
         g_inst_in_cb = 0;
     }
 
-    // 本地模式：不发送网络
-    if (g_inst_mode == INST_MODE_LOCAL) return;
+    // 本地模式：只发送保留通道
+    if (g_inst_mode == INST_MODE_LOCAL) {
+        if (!(g_inst_keep_chn[chn / 32] & (1u << (chn % 32)))) return;
+    }
     if (g_inst_sock == P_INVALID_SOCKET && !inst_init()) return;
 
     // 写入固定 header (7 bytes)
@@ -978,8 +980,25 @@ instrument_listen(instrument_cb cb) {
 }
 
 void
-instrument_local(void) {
+instrument_local(int keep_chn, ...) {
     g_inst_mode = INST_MODE_LOCAL;
+    
+    // 清空保留列表
+    memset(g_inst_keep_chn, 0, sizeof(g_inst_keep_chn));
+    
+    // 如果第一个参数为 0，表示关闭全部
+    if (keep_chn == 0) return;
+    
+    // 设置保留通道
+    g_inst_keep_chn[keep_chn / 32] |= (1u << (keep_chn % 32));
+    
+    va_list args;
+    va_start(args, keep_chn);
+    uint8_t chn;
+    while ((chn = (uint8_t)va_arg(args, int)) != 0) {
+        g_inst_keep_chn[chn / 32] |= (1u << (chn % 32));
+    }
+    va_end(args);
 }
 
 void

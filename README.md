@@ -339,7 +339,8 @@ void my_callback(uint16_t rid, uint8_t chn, const char* tag, char *txt, int len)
 }
 
 // 三种广播模式（默认 host 模式）
-instrument_local();     // local:  只本地回调，不网络
+instrument_local(0);    // local:  只本地回调，不网络
+instrument_local('x', 0);  // local: 保留 'x' 通道发送网络
 // (默认)                 // host:   本地回调 + 127.0.0.1（同主机进程可见）
 instrument_remote();    // remote: 本地回调 + 局域网广播
 
@@ -405,7 +406,8 @@ P_check(expr, action);          // 运行时断言
 ### 分布式监控 (Instrument)
 - `instrument_port()` - 设置通信端口
 - `instrument_listen()` - 启动监听，按序交付消息
-- `instrument_local()` - 设置本地模式（只本地回调，不网络）
+- `instrument_local(0)` - 设置本地模式（只本地回调，不网络）
+- `instrument_local('x', 0)` - 保留指定通道发送网络
 - `instrument_remote()` - 设置远程模式（局域网广播）
 - 默认主机模式：本地回调 + 127.0.0.1（同主机进程可见）
 - `instrument_enable()` / `instrument_enabled()` - 远程选项控制

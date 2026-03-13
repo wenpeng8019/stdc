@@ -262,11 +262,16 @@ void instrument_port(uint16_t port);
 
 /**
  * @brief                       设置进程本地模式
- * @note                        调用后 instrument_slot 只触发本地 instrument_cb 回调
- *                              不发送任何网络消息
+ * @param keep_chn              保留的通道列表，以 0 结尾
+ * @note                        调用后 instrument_slot 只触发本地 instrument_cb 回调，
+ *                              且仅保留通道的消息会发送到网络
  *                              默认为主机模式（host）：本地回调 + 127.0.0.1 回环地址
+ * @example
+ *                              instrument_local(0);         // 关闭全部网络发送
+ *                              instrument_local('x', 0);    // 保留 'x' 通道
+ *                              instrument_local('x', 'y', 0); // 保留 'x' 和 'y' 通道
  */
-void instrument_local(void);
+void instrument_local(int keep_chn, ...);
 
 /**
  * @brief                       设置远程广播模式

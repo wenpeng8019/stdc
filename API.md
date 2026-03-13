@@ -790,7 +790,11 @@ void instrument_port(uint16_t port);
 ret_t instrument_listen(instrument_cb cb);
 
 // 设置本地模式（只触发本地回调，不网络）
-void instrument_local(void);
+// 参数: keep_chn, ... 以 0 结尾的通道列表，这些通道仍发送网络
+// 示例: instrument_local(0);           // 关闭全部网络发送
+//       instrument_local('x', 0);      // 保留 'x' 通道
+//       instrument_local('x', 'y', 0); // 保留 'x' 和 'y' 通道
+void instrument_local(uint8_t keep_chn, ...);
 
 // 设置远程模式（局域网广播）
 void instrument_remote(void);
@@ -809,7 +813,8 @@ void instrument_slot(uint8_t chn, const char* tag, const char* fmt, va_list para
 
 | 模式 | 调用 | 行为 |
 |------|------|------|
-| **local** | `instrument_local()` | 只触发本地回调，不网络 |
+| **local** | `instrument_local(0)` | 只触发本地回调，不网络 |
+| **local+keep** | `instrument_local('x', 0)` | 本地回调 + 保留通道发送网络 |
 | **host** | **默认** | 本地回调 + `127.0.0.1`（同主机进程可见） |
 | **remote** | `instrument_remote()` | 本地回调 + 局域网广播 |
 
@@ -846,7 +851,8 @@ int main() {
     }
     
     // 可选：设置本地模式（不发送网络广播）
-    // instrument_local();
+    // instrument_local(0);
+    // instrument_local('x', 0);  // 保留 'x' 通道
     
     // 远程控制：启用选项 0
     instrument_enable(0, true);
