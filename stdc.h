@@ -5,6 +5,7 @@
 #pragma clang diagnostic ignored "-Wunused-function"
 #pragma ide diagnostic ignored "OCUnusedMacroInspection"
 #pragma ide diagnostic ignored "OCUnusedGlobalDeclarationInspection"
+#pragma ide diagnostic ignored "UnreachableCallsOfFunction"
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -394,7 +395,8 @@ static inline void print(const char* fmt, ...) {
     uint8_t chn = (uint8_t)LOG_DEF;
     static TLS char s_file[256];
     if (!fmt || !*fmt) {
-        snprintf(tag = s_file, sizeof(s_file), "%s:%d", va_arg(args, const char*), va_arg(args, int));
+        snprintf(s_file, sizeof(s_file), "%s:%d", va_arg(args, const char*), va_arg(args, int));
+        tag = s_file;
         fmt = va_arg(args, const char*);
         chn = (uint8_t)LOG_SLOT_DEBUG;
     }
@@ -1182,7 +1184,7 @@ static inline ret_t P_home_dir(char buffer[], uint32_t size) {
 #else
     // POSIX: 使用 getpwuid 获取用户 home 目录
     struct passwd* pw = getpwuid(getuid());
-    if (!pw || !pw->pw_dir || !pw->pw_dir[0]) return E_EXTERNAL(-1);
+    if (!pw || !pw->pw_dir || !pw->pw_dir[0]) return E_UNKNOWN;
     size_t len = strlen(pw->pw_dir);
     if (len >= size) return E_OUT_OF_CAPACITY;
     memcpy(buffer, pw->pw_dir, len + 1);
@@ -1349,8 +1351,8 @@ static inline ret_t P_tmp_file(char buffer[], uint32_t size) {
  */
 static inline size_t P_root(const char* path) {
     
-    size_t len = strlen(path);
 #if P_WIN
+    size_t len = strlen(path);
     if (len >= 2 && P_IS_SEP(path[0]) && P_IS_SEP(path[1])) {
         // UNC: \\server\share
         const char* p = path + 2;
