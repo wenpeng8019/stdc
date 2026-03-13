@@ -2374,7 +2374,8 @@ static inline void P_net_cleanup(void) {
     WSACleanup();
 }
 #else
-#define P_net_init()        E_NONE
+// 使用 volatile 可避免 "always false" 警告
+#define P_net_init()        ((ret_t)((volatile int){E_NONE}))
 #define P_net_cleanup()     ((void)0)
 #endif
 
