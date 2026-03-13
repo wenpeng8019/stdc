@@ -261,6 +261,21 @@ log_slot(log_level_e level, const char* tag, const char* fmt, va_list params);
 void instrument_port(uint16_t port);
 
 /**
+ * @brief                       设置进程本地模式
+ * @note                        调用后 instrument_slot 只触发本地 instrument_cb 回调
+ *                              不发送任何网络消息
+ *                              默认为主机模式（host）：本地回调 + 127.0.0.1 回环地址
+ */
+void instrument_local(void);
+
+/**
+ * @brief                       设置远程广播模式
+ * @note                        调用后 instrument_slot 向局域网广播消息
+ *                              默认为主机模式（host）：本地回调 + 127.0.0.1 回环地址
+ */
+void instrument_remote(void);
+
+/**
  * @brief                       instrument 消息回调接口定义
  * @param rid                   发送方节点 ID（本地触发时为 0）
  * @param chn                   消息通道 (当前用于传输日志时对应 log_level_e)
@@ -290,14 +305,6 @@ void instrument_slot(uint8_t chn, const char* tag, const char* fmt, va_list para
  *                              丢包时会输出 stderr 警告信息
  */
 ret_t instrument_listen(instrument_cb cb);
-
-/**
- * @brief                       设置本地模式
- * @note                        调用后 instrument_slot 不再通过网络广播
- *                              而是只触发本地 instrument_cb 回调（本地回调的 rid 参数为 0）
- *                              默认会同时触发本地回调和网络广播
- */
-void instrument_local(void);
 
 /**
  * @brief                       启用/禁用指定的 instrument 选项

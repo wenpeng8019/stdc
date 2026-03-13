@@ -40,7 +40,14 @@ static TLS int                  g_inst_in_cb  = 0;                  // 防止回
 static inst_slot_t              g_inst_win[INST_WINDOW_SIZE];
 static uint16_t                 g_inst_next   = 0;                  // 下一个期望 seq
 static bool                     g_inst_synced = false;              // 首包同步标记
-static bool                     g_inst_local  = false;              // 本地模式标志
+
+// 广播模式
+typedef enum {
+    INST_MODE_LOCAL  = 0,   // 只本地回调，不网络
+    INST_MODE_HOST   = 1,   // 本地回调 + 127.0.0.1（默认，同一主机可见）
+    INST_MODE_REMOTE = 2,   // 本地回调 + 局域网广播
+} inst_mode_e;
+static inst_mode_e              g_inst_mode   = INST_MODE_HOST;     // 默认主机模式
 
 
 // 选项 bitset
@@ -790,11 +797,13 @@ static bool inst_init(void) {
         return false;
     }
 
-    // 广播目标地址
+    // 目标地址：根据模式设置
     memset(&g_inst_dest, 0, sizeof(g_inst_dest));
     g_inst_dest.sin_family      = AF_INET;
     g_inst_dest.sin_port        = htons(g_inst_port);
-    g_inst_dest.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+    g_inst_dest.sin_addr.s_addr = (g_inst_mode == INST_MODE_REMOTE)
+                                    ? htonl(INADDR_BROADCAST)
+                                    : htonl(INADDR_LOOPBACK);  // 127.0.0.1
 
     // 生成随机 rid
     g_inst_rid = (uint16_t)(P_tick_us() ^ (uintptr_t)&g_inst_sock);
@@ -903,7 +912,7 @@ inst_send_buf(uint8_t chn, char* buf, int tag_len, int text_len) {
     }
 
     // 本地模式：不发送网络
-    if (g_inst_local) return;
+    if (g_inst_mode == INST_MODE_LOCAL) return;
     if (g_inst_sock == P_INVALID_SOCKET && !inst_init()) return;
 
     // 写入固定 header (7 bytes)
@@ -970,7 +979,16 @@ instrument_listen(instrument_cb cb) {
 
 void
 instrument_local(void) {
-    g_inst_local = true;
+    g_inst_mode = INST_MODE_LOCAL;
+}
+
+void
+instrument_remote(void) {
+    g_inst_mode = INST_MODE_REMOTE;
+    // 如果 socket 已初始化，更新目标地址
+    if (g_inst_sock != P_INVALID_SOCKET) {
+        g_inst_dest.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+    }
 }
 
 // ---- 监听端 ----

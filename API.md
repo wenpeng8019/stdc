@@ -789,8 +789,11 @@ void instrument_port(uint16_t port);
 // 内部处理乱序和丢包，丢包时输出 stderr 警告
 ret_t instrument_listen(instrument_cb cb);
 
-// 设置本地模式（不发送网络广播，只触发本地回调）
+// 设置本地模式（只触发本地回调，不网络）
 void instrument_local(void);
+
+// 设置远程模式（局域网广播）
+void instrument_remote(void);
 
 // 启用/禁用指定选项（通过 UDP 广播同步到所有节点）
 ret_t instrument_enable(uint16_t idx, bool enable);
@@ -801,6 +804,14 @@ bool instrument_enabled(uint16_t idx);
 // 发送消息包（内部调用，通常由日志系统自动触发）
 void instrument_slot(uint8_t chn, const char* tag, const char* fmt, va_list params);
 ```
+
+### 广播模式
+
+| 模式 | 调用 | 行为 |
+|------|------|------|
+| **local** | `instrument_local()` | 只触发本地回调，不网络 |
+| **host** | **默认** | 本地回调 + `127.0.0.1`（同主机进程可见） |
+| **remote** | `instrument_remote()` | 本地回调 + 局域网广播 |
 
 ### 协议说明
 
