@@ -86,13 +86,19 @@
 // 编译器一致性： __GNUC__ 包含 clang 和 gcc; _MSC_VER 包含 Visual Studio
 
 #if P_POSIX_LIKE
-#define P_DIR_SEP '/'
+#define P_SEP '/'
 #else
-#define P_DIR_SEP '\\'
+#define P_SEP '\\'
+#endif
+
+#if P_WIN
+    #define P_IS_SEP(c) ((c) == '/' || (c) == '\\')
+#else
+    #define P_IS_SEP(c) ((c) == '/')
 #endif
 
 #ifndef __FILE_NAME__
-#define __FILE_NAME__  (strrchr(__FILE__, P_DIR_SEP) ? strrchr(__FILE__, P_DIR_SEP) + 1 : __FILE__)
+#define __FILE_NAME__  (strrchr(__FILE__, P_SEP) ? strrchr(__FILE__, P_SEP) + 1 : __FILE__)
 #endif
 
 // c++ 优先使用 thread_local，它是 c++ 11 的标准
@@ -1089,9 +1095,11 @@ static bool uint32_circle_newer(uint32_t a, uint32_t b) { uint32_t diff = a - b;
 #if P_WIN
 #   include <direct.h>              // _mkdir, _getcwd, _get_pgmptr
 #   include <io.h>                  // _access, _stat64
+#   include <shlobj.h>              // SHGetKnownFolderPath
     typedef struct _stat64 stat_t;
 #elif P_DARWIN
 #   include <mach-o/dyld.h>         // _NSGetExecutablePath
+#   include <sysdir.h>              // sysdir_start_search_path_enumeration
     typedef struct stat stat_t;
 #elif P_BSD
 #   include <sys/sysctl.h>          // sysctl
@@ -1102,6 +1110,7 @@ static bool uint32_circle_newer(uint32_t a, uint32_t b) { uint32_t diff = a - b;
 #if P_POSIX_LIKE
 #   include <dirent.h>              // opendir, readdir, closedir
 #   include <sys/stat.h>            // stat, mkdir
+#   include <pwd.h>                 // getpwuid
 #endif
 
 #ifndef PATH_MAX
@@ -1111,6 +1120,415 @@ static bool uint32_circle_newer(uint32_t a, uint32_t b) { uint32_t diff = a - b;
 #       define PATH_MAX 4096
 #   endif
 #endif
+
+
+
+//-----------------------------------------------------------------------------
+
+static inline ret_t P_work_dir(char buffer[], uint32_t size) {
+#if P_WIN
+    if (!GetCurrentDirectory(size, buffer)) return E_EXTERNAL(GetLastError());
+#else
+    if (!getcwd(buffer, size)) return E_EXTERNAL(errno);
+#endif
+    return E_NONE;
+}
+
+static inline ret_t P_home_dir(char buffer[], uint32_t size) {
+#if P_WIN
+    // Windows: 使用 SHGetKnownFolderPath 获取用户配置文件目录
+    PWSTR wpath = NULL;
+    HRESULT hr = SHGetKnownFolderPath(&FOLDERID_Profile, 0, NULL, &wpath);
+    if (FAILED(hr)) return E_EXTERNAL(hr);
+    int len = WideCharToMultiByte(CP_UTF8, 0, wpath, -1, buffer, (int)size, NULL, NULL);
+    CoTaskMemFree(wpath);
+    if (len == 0) return E_OUT_OF_CAPACITY;
+#else
+    // POSIX: 使用 getpwuid 获取用户 home 目录
+    struct passwd* pw = getpwuid(getuid());
+    if (!pw || !pw->pw_dir || !pw->pw_dir[0]) return E_EXTERNAL(-1);
+    size_t len = strlen(pw->pw_dir);
+    if (len >= size) return E_OUT_OF_CAPACITY;
+    memcpy(buffer, pw->pw_dir, len + 1);
+#endif
+    return E_NONE;
+}
+
+static inline ret_t P_download_dir(char buffer[], uint32_t size) {
+#if P_WIN
+    // Windows: 使用 SHGetKnownFolderPath 获取用户设置的下载目录
+    PWSTR wpath = NULL;
+    HRESULT hr = SHGetKnownFolderPath(&FOLDERID_Downloads, 0, NULL, &wpath);
+    if (FAILED(hr)) return E_EXTERNAL(hr);
+    int len = WideCharToMultiByte(CP_UTF8, 0, wpath, -1, buffer, (int)size, NULL, NULL);
+    CoTaskMemFree(wpath);
+    if (len == 0) return E_OUT_OF_CAPACITY;
+    return E_NONE;
+#elif P_DARWIN
+    // macOS: 使用 sysdir API 获取下载目录
+    sysdir_search_path_enumeration_state state = sysdir_start_search_path_enumeration(
+        SYSDIR_DIRECTORY_DOWNLOADS, SYSDIR_DOMAIN_MASK_USER);
+    state = sysdir_get_next_search_path_enumeration(state, buffer);
+    if (state == 0) {
+        // fallback to ~/Downloads
+        ret_t r = P_home_dir(buffer, size);
+        if (r != E_NONE) return r;
+        size_t len = strlen(buffer);
+        if (len + 10 >= size) return E_OUT_OF_CAPACITY;
+        memcpy(buffer + len, "/Downloads", 11);
+    }
+    // sysdir 返回的路径可能包含 ~ ，需要展开
+    if (buffer[0] == '~') {
+        char home[PATH_MAX];
+        ret_t r = P_home_dir(home, sizeof(home));
+        if (r != E_NONE) return r;
+        size_t home_len = strlen(home);
+        size_t rest_len = strlen(buffer + 1);  // 跳过 ~
+        if (home_len + rest_len >= size) return E_OUT_OF_CAPACITY;
+        memmove(buffer + home_len, buffer + 1, rest_len + 1);
+        memcpy(buffer, home, home_len);
+    }
+    return E_NONE;
+#else
+    // Linux: 优先使用 XDG_DOWNLOAD_DIR，否则回退到 ~/Downloads
+    const char* xdg_download = getenv("XDG_DOWNLOAD_DIR");
+    if (xdg_download && xdg_download[0]) {
+        size_t len = strlen(xdg_download);
+        if (len >= size) return E_OUT_OF_CAPACITY;
+        memcpy(buffer, xdg_download, len + 1);
+        return E_NONE;
+    }
+    // fallback to ~/Downloads
+    ret_t r = P_home_dir(buffer, size);
+    if (r != E_NONE) return r;
+    size_t len = strlen(buffer);
+    if (len + 10 >= size) return E_OUT_OF_CAPACITY;
+    memcpy(buffer + len, "/Downloads", 11);
+    return E_NONE;
+#endif
+}
+
+static inline ret_t P_exe_file(char buffer[], uint32_t size) {
+#if P_WIN
+    char *path;
+    if (_get_pgmptr(&path) != 0) {
+        buffer[0] = 0;
+        return E_EXTERNAL(errno);
+    }
+    size_t len = strlen(path);
+    if (len >= size) return E_OUT_OF_CAPACITY;
+    memcpy(buffer, path, len + 1);
+#elif P_DARWIN
+    if (_NSGetExecutablePath(buffer, &size) != 0) {
+        buffer[0] = 0;
+        return E_EXTERNAL(errno);
+    }
+    char *canonicalPath = realpath(buffer, NULL);
+    if (!canonicalPath) {
+        buffer[0] = 0;
+        return E_EXTERNAL(errno);
+    }
+    size_t len = strlen(canonicalPath);
+    if (len >= size) {
+        free(canonicalPath);
+        buffer[0] = 0;
+        return E_OUT_OF_CAPACITY;
+    }
+    memcpy(buffer, canonicalPath, len + 1);
+    free(canonicalPath);
+#elif P_BSD
+    int mib[4];  mib[0] = CTL_KERN;  mib[1] = KERN_PROC;  mib[2] = KERN_PROC_PATHNAME;  mib[3] = -1;
+    if (sysctl(mib, 4, buffer, &size, NULL, 0) != 0) {
+        buffer[0] = 0;
+        return E_EXTERNAL(errno);
+    }
+#elif P_LINUX
+    ssize_t len = readlink("/proc/self/exe", buffer, size);
+    if (len == -1) {
+        buffer[0] = 0;
+        return E_EXTERNAL(errno);
+    }
+    if ((size_t)len >= size) {
+        buffer[0] = 0;
+        return E_OUT_OF_CAPACITY;
+    }
+    buffer[len] = '\0';
+#elif defined(__QNX__)
+    FILE* fp = fopen("/proc/self/exefile", "r");
+    if (!fp) {
+        buffer[0] = 0;
+        return E_EXTERNAL(errno);
+    }
+    size_t read_size = fread(buffer, 1, size - 1, fp);
+    fclose(fp);
+    buffer[read_size] = 0;
+    // 移除末尾换行符
+    if (read_size > 0 && buffer[read_size - 1] == '\n') buffer[read_size - 1] = 0;
+#else
+#error "Unsupported platform"
+#endif
+    return E_NONE;
+}
+
+/*
+ * 生成一个临时文件路径
+ * - 使用系统临时目录
+ * - 生成唯一的文件名
+ * - 不实际创建文件，只返回路径
+ */
+static inline ret_t P_tmp_file(char buffer[], uint32_t size) {
+#if P_WIN
+    // GetTempPathA 直接写入 buffer
+    DWORD len = GetTempPathA(size, buffer);
+    if (len == 0 || len >= size) return E_EXTERNAL(GetLastError());
+    
+    // 在后面追加唯一文件名: tmp_<pid>_<tick>_<counter>.tmp
+    static volatile long counter = 0;
+    long cnt = InterlockedIncrement(&counter);
+    int n = snprintf(buffer + len, size - len, "tmp_%lu_%lu_%ld.tmp", 
+                     (unsigned long)GetCurrentProcessId(), 
+                     (unsigned long)GetTickCount(), cnt);
+    if (n < 0 || (uint32_t)n >= size - len) return E_OUT_OF_CAPACITY;
+#else
+    // 获取临时目录
+    const char* tmp_dir = getenv("TMPDIR");
+    if (!tmp_dir || !tmp_dir[0]) tmp_dir = getenv("TMP");
+    if (!tmp_dir || !tmp_dir[0]) tmp_dir = getenv("TEMP");
+    if (!tmp_dir || !tmp_dir[0]) tmp_dir = "/tmp";
+    
+    // 构造模板并用 mkstemp 生成唯一文件名
+    int n = snprintf(buffer, size, "%s/tmp_XXXXXX", tmp_dir);
+    if (n < 0 || (uint32_t)n >= size) return E_OUT_OF_CAPACITY;
+    int fd = mkstemp(buffer);  // 创建并打开文件
+    if (fd < 0) return E_EXTERNAL(errno);
+    close(fd);                 // 关闭文件（保留路径）
+#endif
+    return E_NONE;
+}
+
+/*
+ * 计算路径的根目录长度
+ * - Unix: / 返回 1
+ * - Windows: C:\ 返回 3，C: 返回 2，\\server\share 返回 share 结束位置
+ */
+static inline size_t P_root(const char* path) {
+    
+    size_t len = strlen(path);
+#if P_WIN
+    if (len >= 2 && P_IS_SEP(path[0]) && P_IS_SEP(path[1])) {
+        // UNC: \\server\share
+        const char* p = path + 2;
+        while (*p && !P_IS_SEP(*p)) p++;  // 跳过 server
+        if (*p) {
+            p++;
+            while (*p && !P_IS_SEP(*p)) p++;  // 跳过 share
+            return (size_t)(p - path);
+        }
+        return len;  // 只有 \\server，整个都是根
+    } else if (len >= 2 && ((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) && path[1] == ':') {
+        // 驱动器号: "C:" 或 "C:\"
+        return (len >= 3 && P_IS_SEP(path[2])) ? 3 : 2;
+    }
+    return 0;
+#else
+    return P_IS_SEP(path[0]) ? 1 : 0;
+#endif
+}
+
+/*
+ * 返回 path 的父目录
+ * - 如果 path 是文件，返回文件所在目录
+ * - 如果 path 是目录，返回上级目录
+ * - 不会检测 path 是否真实存在，仅根据字符串处理
+ * - 返回值：成功返回 root_len（根目录长度），失败返回 -1
+ */
+static inline int P_base(char buffer[], uint32_t size, const char* path) {
+    
+    size_t len = strlen(path);
+    if (len >= size) return -1;
+    memcpy(buffer, path, len + 1);
+    
+    size_t root_len = P_root(buffer);
+    
+    // 移除末尾分隔符（但保留根目录）
+    while (len > root_len && P_IS_SEP(buffer[len - 1])) len--;
+    // 回退到上一个分隔符
+    while (len > root_len && !P_IS_SEP(buffer[len - 1])) len--;
+    // 移除尾部分隔符（但保留根目录）
+    while (len > root_len && P_IS_SEP(buffer[len - 1])) len--;
+    
+    // 相对路径回退到空，返回 "."
+    if (len == 0) buffer[len++] = '.';
+    buffer[len] = 0;
+    return (int)root_len;
+}
+
+/*
+ * 返回 path 的目录部分
+ * - 如果 path 以分隔符结尾，视为目录，返回 path 本身
+ * - 如果 path 不以分隔符结尾，则检测：
+ *   - 如果是目录，返回 path 本身
+ *   - 如果是文件，返回文件所在目录
+ * - 返回的路径会去除末尾分隔符（保留根目录）
+ * - 返回值：成功返回 root_len（根目录长度），失败返回 -1
+ */
+static inline int P_dir(char buffer[], uint32_t size, const char* path) {
+    
+    size_t len = strlen(path);
+    if (len >= size) return -1;
+    memcpy(buffer, path, len + 1);
+    
+    size_t root_len = P_root(buffer);
+
+    // 如果不以分隔符结尾，需要检测是目录还是文件，如果是文件，回退到父目录
+    if (!P_IS_SEP(buffer[len - 1])) {
+#if P_WIN
+        DWORD attr = GetFileAttributesA(buffer);
+        if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+            while (len > root_len && !P_IS_SEP(buffer[len - 1])) len--;
+        }
+#else
+        struct stat st; // 注: 这里只使用 st_mode 判断类型，不关注是否为 stat64
+        if (stat(buffer, &st) == 0 && !S_ISDIR(st.st_mode)) {            
+            while (len > root_len && !P_IS_SEP(buffer[len - 1])) len--;
+        }
+#endif
+    }
+    
+    // 移除末尾分隔符（保留根目录）
+    while (len > root_len && P_IS_SEP(buffer[len - 1])) len--;
+    
+    // 相对路径回退到空，返回 "."
+    if (len == 0) buffer[len++] = '.';
+    buffer[len] = 0;
+
+    return (int)root_len;
+}
+
+/*
+ * 根据 base 和 path 构造全路径
+ * - 前置条件：buffer != NULL, size > 0, path != NULL, path[0] != 0
+ * - 如果 path 是绝对路径，直接使用 path
+ * - 如果 base 为空，使用当前工作目录
+ * - base 如果是文件则取其目录部分
+ * - 处理 path 中的 .. 回退
+ * - 返回 true 表示成功，false 表示缓冲区不足
+ * 注意：
+ * - path 会被规范化（处理 ./ 和 ../），但 base 不会，调用方应确保 base 中不含 ./ 或 ../
+ * - 支持 file:// URI 格式的输入，但输出始终为普通文件系统路径（用于系统调用）
+ */
+static inline bool P_file(char buffer[], uint32_t size, const char* base, cstr_t path) {
+
+    // 处理 path 的 file:// 前缀
+    // file:///path (Unix) → /path
+    // file:///C:/path (Windows) → C:/path
+    // file://server/share (Windows UNC) → \\server\share
+    if (strncmp(path, "file://", 7) == 0) {
+        path += 7;
+#if P_WIN
+        if (path[0] != '/') {
+            // file://server/share → UNC 路径
+            if (size < 3) return false;
+            buffer[0] = '\\';
+            buffer[1] = '\\';
+            size_t i = 2;
+            while (*path && i < size - 1) {
+                buffer[i++] = (*path == '/') ? '\\' : *path;
+                path++;
+            }
+            buffer[i] = 0;
+            return i < size;
+        }
+        path++;  // 跳过第一个 /，变成 C:/path
+#endif
+    }
+
+    // 处理 base 的 file:// 前缀
+    if (base && strncmp(base, "file://", 7) == 0) {
+        base += 7;
+#if P_WIN
+        // Windows: file:///C:/path → /C:/path → C:/path
+        if (base[0] == '/') base++;
+#endif
+        // Unix: file:///path → /path (保留 / 作为绝对路径)
+    }
+
+    // 如果 path 是绝对路径，直接使用
+#if P_WIN
+    bool is_abs = (path[0] == '/' || path[0] == '\\' || (path[0] && path[1] == ':'));
+#else
+    bool is_abs = (path[0] == '/');
+#endif
+    if (is_abs) {
+        size_t len = strlen(path);
+        if (len >= size) return false;
+        memcpy(buffer, path, len + 1);
+        return true;
+    }
+
+    // 获取 base 目录到 buffer
+#if P_WIN
+    char sep = '\\';  // Windows 默认分隔符，后续根据 base 中实际使用的分隔符调整
+#endif
+    int root_len;
+    if (!base || !base[0]) {
+        // base 为空，使用当前工作目录
+        if (P_work_dir(buffer, size) != E_NONE) return false;
+        root_len = (int)P_root(buffer);
+    } else {
+        // 使用 P_dir 获取 base 的目录部分
+        root_len = P_dir(buffer, size, base);
+        if (root_len < 0) return false;
+#if P_WIN
+        // 检测 base 中使用的分隔符风格
+        if (strchr(base, '/') && !strchr(base, '\\')) sep = '/';
+#endif
+    }
+    size_t len = strlen(buffer);
+
+    // 处理 path 中的 .. 和拼接
+    const char* p = path;
+    while (*p) {
+        // 跳过分隔符
+        while (P_IS_SEP(*p)) p++;
+        if (!*p) break;
+
+        // 找到下一段
+        const char* seg = p;
+        while (*p && !P_IS_SEP(*p)) p++;
+        size_t seg_len = p - seg;
+
+        // 对于 ../ 回退上一层
+        if (seg_len == 2 && seg[0] == '.' && seg[1] == '.') {
+            while (len > (size_t)root_len && !P_IS_SEP(buffer[len-1])) len--;
+            while (len > (size_t)root_len && P_IS_SEP(buffer[len-1])) len--;
+            buffer[len] = 0;
+        }
+        // 如果不是 ./ 则构建路径 seg
+        else if (seg_len != 1 || seg[0] != '.') { 
+            
+            // 有前缀路径，加分隔符
+            if (len > 0) {
+                if (len + 1 + seg_len >= size) return false;
+#if P_WIN
+                buffer[len++] = sep;
+#else
+                buffer[len++] = '/';
+#endif
+            }
+            // 否则路径回退到空，则直接从头开始
+            else if (seg_len >= size) return false;
+            
+            memcpy(buffer + len, seg, seg_len);
+            len += seg_len;
+            buffer[len] = 0;
+        }
+    }
+
+    return true;
+}
+
+//-----------------------------------------------------------------------------
 
 static inline bool P_access(cstr_t csFilePathName, bool bAsReadable, bool bAsWritable) {
 #if P_WIN
@@ -1141,7 +1559,7 @@ static inline int64_t P_size(cstr_t csFilePathName) {
     return ret ? ret : st.st_size;
 }
 
-static inline ret_t P_remo(cstr_t csFilePathName) {
+static inline ret_t P_remove(cstr_t csFilePathName) {
 #if P_WIN
     if (DeleteFile(csFilePathName)) return E_NONE;
    return E_EXTERNAL(GetLastError());
@@ -1151,100 +1569,29 @@ static inline ret_t P_remo(cstr_t csFilePathName) {
 #endif
 }
 
-static inline bool P_exe_file(char buffer[], uint32_t size) {
-#if P_WIN
-    char *path;
-    if (_get_pgmptr(&path) != 0) {
-        buffer[0] = 0;
-        printf("error: get exe path error(%d)\n", errno);  // todo 应该用 log 接口
-        return false;
-    }
-    strncpy(buffer, path, size);
-    buffer[size-1] = 0;
-#elif P_DARWIN
-    if (_NSGetExecutablePath(buffer, &size) != 0) {
-        buffer[0] = 0;
-        printf("error: get exe path error(%d)\n", errno);
-        return false;
-    }
-    char *canonicalPath = realpath(buffer, NULL);
-    if (!canonicalPath) {
-        buffer[0] = 0;
-        printf("error: get exe path error(%d)\n", errno);
-        return false;
-    }
-    strncpy(buffer, canonicalPath, size);
-    buffer[size-1] = 0;
-    free(canonicalPath);
-#elif P_BSD
-    int mib[4];  mib[0] = CTL_KERN;  mib[1] = KERN_PROC;  mib[2] = KERN_PROC_PATHNAME;  mib[3] = -1;
-    if (sysctl(mib, 4, buffer, &size, NULL, 0) != 0)
-        *buffer = '\0';
-#elif P_LINUX
-    ssize_t len = readlink("/proc/self/exe", buffer, size);
-    if (len == -1 || len == size) {
-        buffer[0] = '\0';
-        printf("error: get exe path error(%d)\n", errno);
-        return false;
-    }
-    buffer[len] = '\0';
-#elif defined(__QNX__)
-    FILE* fp = fopen("/proc/self/exefile", "r");
-    if (!fp) {
-        *buffer = '\0';
-        print("E: read exe path failed: %d\n", errno);
-        return false;
-    }
-    size = fread(buffer, 1, size, fp);
-    fclose(fp);
-    if (buffer[--size]) buffer[size] = 0;
-#else
-#error "Unsupported platform"
-#endif
-    return true;
-}
-
 //-----------------------------------------------------------------------------
-
-static inline ret_t P_work_dir(char buffer[], uint32_t size) {
-#if P_WIN
-    if (!GetCurrentDirectory(size, buffer)) return E_EXTERNAL(GetLastError());
-#else
-    if (!getcwd(buffer, size)) return E_EXTERNAL(errno);
-#endif
-    return E_NONE;
-}
 
 static inline ret_t P_is_dir(const char* path, bool writeable) {
 #if P_WIN
     DWORD dwAttr = GetFileAttributes(path);
-   if (dwAttr == INVALID_FILE_ATTRIBUTES) {
-       printf("debug: dir \"%s\" access error(%d)\n", path, GetLastError());
-       return E_EXTERNAL(GetLastError());
-   }
-   if (!(dwAttr & FILE_ATTRIBUTE_DIRECTORY)) {
-       printf("debug: dir \"%s\" not a directory\n", path);
-       return E_NONE_CONTEXT;
-   }
+    if (dwAttr == INVALID_FILE_ATTRIBUTES) {
+        DWORD err = GetLastError();
+        if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) return E_NONE_EXISTS;
+        return E_EXTERNAL(err);
+    }
+    if (!(dwAttr & FILE_ATTRIBUTE_DIRECTORY)) return E_NONE_CONTEXT;
+    if (writeable && (dwAttr & FILE_ATTRIBUTE_READONLY)) return E_NO_PERMISSION;
 #else
-    // 注: access 对路径末尾的 '/' 会自适应
-    if (access(path, writeable ? W_OK : F_OK) != 0) {
-        if (errno == ENOENT) { printf("debug: dir \"%s\" no exits\n", path); return E_NONE_EXISTS; }
-        if (errno == EACCES || errno == EPERM) { printf("debug: dir \"%s\" no permission\n", path); return E_NO_PERMISSION; }
-        printf("debug: dir \"%s\" access error(%d)\n", path, errno);
+    struct stat st; // 注: 这里只使用 st_mode 判断类型，不关注是否为 stat64
+    if (stat(path, &st) != 0) {
+        if (errno == ENOENT) return E_NONE_EXISTS;
         return E_EXTERNAL(errno);
     }
-
-    DIR* dp = opendir(path);
-    if (!dp) {
-        if (errno == ENOTDIR) {
-            printf("debug: dir \"%s\" not a directory\n", path);
-            return E_NONE_CONTEXT;
-        }
-        printf("debug: dir \"%s\" access error(%d)\n", path, errno);
+    if (!S_ISDIR(st.st_mode)) return E_NONE_CONTEXT;
+    if (writeable && access(path, W_OK) != 0) {
+        if (errno == EACCES || errno == EPERM) return E_NO_PERMISSION;
         return E_EXTERNAL(errno);
     }
-    closedir(dp);
 #endif
     return E_NONE;
 }

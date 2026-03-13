@@ -273,7 +273,46 @@ print("I: 耗时: %lld 毫秒\n", elapsed_ms);
 
 跨平台文件系统操作。
 
-### 函数
+### 路径函数
+
+```c
+// 获取当前工作目录
+ret_t P_work_dir(char buffer[], uint32_t size);
+
+// 获取用户主目录
+ret_t P_home_dir(char buffer[], uint32_t size);
+
+// 获取用户下载目录
+ret_t P_download_dir(char buffer[], uint32_t size);
+
+// 获取可执行文件路径
+ret_t P_exe_file(char buffer[], uint32_t size);
+
+// 生成临时文件路径（会创建空文件）
+ret_t P_tmp_file(char buffer[], uint32_t size);
+
+// 计算路径的根目录长度
+// Unix: "/" 返回 1
+// Windows: "C:\" 返回 3, "\\server\share" 返回 share 结束位置
+size_t P_root(const char* path);
+
+// 获取路径的父目录（纯字符串操作）
+// 返回值：成功返回 root_len，失败返回 -1
+int P_base(char buffer[], uint32_t size, const char* path);
+
+// 获取路径的目录部分（检测文件/目录类型）
+// - 如果 path 以分隔符结尾或是目录，返回 path 本身
+// - 如果 path 是文件，返回文件所在目录
+// 返回值：成功返回 root_len，失败返回 -1
+int P_dir(char buffer[], uint32_t size, const char* path);
+
+// 根据 base 和 path 构造全路径
+// - 支持相对路径、绝对路径、file:// URI
+// - 处理 ./ 和 ../ 规范化
+bool P_file(char buffer[], uint32_t size, const char* base, const char* path);
+```
+
+### 文件操作函数
 
 ```c
 // 检查文件访问权限
@@ -287,12 +326,6 @@ int64_t P_size(const char* path);
 
 // 删除文件或空目录
 ret_t P_remo(const char* path);
-
-// 获取可执行文件路径
-bool P_exe_file(char buffer[], uint32_t size);
-
-// 获取当前工作目录
-ret_t P_work_dir(char buffer[], uint32_t size);
 
 // 检查路径是否为目录
 ret_t P_is_dir(const char* path, bool writeable);
@@ -310,14 +343,28 @@ ret_t P_read_link(const char* path, char* buffer, size_t size);
 ### 示例
 
 ```c
+// 获取各种系统目录
+char home[256], downloads[256], tmp[256];
+P_home_dir(home, sizeof(home));
+P_download_dir(downloads, sizeof(downloads));
+P_tmp_file(tmp, sizeof(tmp));
+print("I: 主目录: %s\n", home);
+print("I: 下载目录: %s\n", downloads);
+print("I: 临时文件: %s\n", tmp);
+
+// 路径拼接
+char full_path[256];
+P_file(full_path, sizeof(full_path), "/home/user/project", "../config/app.ini");
+// full_path = "/home/user/config/app.ini"
+
+// 获取父目录
+char parent[256];
+P_base(parent, sizeof(parent), "/home/user/file.txt");
+// parent = "/home/user"
+
 if (P_access("config.ini", true, false)) {
     int64_t size = P_size("config.ini");
     print("I: 配置文件大小: %lld 字节\n", size);
-}
-
-char exe_path[256];
-if (P_exe_file(exe_path, sizeof(exe_path))) {
-    print("I: 可执行文件: %s\n", exe_path);
 }
 ```
 
