@@ -38,6 +38,7 @@ typedef struct {
     uint16_t rid;                                    // 发送方 rid
 } inst_slot_t;
 static instrument_cb            g_inst_cb     = NULL;
+static uint16_t                 g_inst_options_base = 0;
 static TLS int                  g_inst_in_cb  = 0;                  // 防止回调递归
 static inst_slot_t              g_inst_win[INST_WINDOW_SIZE];
 static uint16_t                 g_inst_next   = 0;                  // 下一个期望 seq
@@ -871,8 +872,8 @@ instrument_enable(uint16_t idx, bool enable) {
     if (g_inst_sock == P_INVALID_SOCKET && !inst_init())
         return E_EXTERNAL(P_sock_errno());
 
-    uint16_t byte_idx = idx / 8;
-    uint8_t  bit_mask = (uint8_t)(1u << (idx % 8));
+    idx += g_inst_options_base;
+    uint16_t byte_idx = idx / 8; uint8_t  bit_mask = (uint8_t)(1u << (idx % 8));
 
     inst_bits_reserve(byte_idx);
     if (byte_idx >= g_inst_bits_len) return E_OUT_OF_MEMORY;
@@ -887,7 +888,7 @@ instrument_enable(uint16_t idx, bool enable) {
 }
 
 bool
-instrument_enabled(uint16_t idx) {
+instrument_enabled(uint16_t idx) { idx += g_inst_options_base;
     uint16_t byte_idx = idx / 8;
     if (byte_idx >= g_inst_bits_len) return false;
     return (g_inst_bits[byte_idx] & (1u << (idx % 8))) != 0;
@@ -969,7 +970,7 @@ instrument_slot(uint8_t chn, const char* tag, const char* fmt, va_list params) {
 // ---- 监听端 ----
 
 ret_t
-instrument_listen(instrument_cb cb) {
+instrument_listen(instrument_cb cb, uint16_t options_base) {
 
     if (g_inst_sock == P_INVALID_SOCKET && !inst_init())
         return E_EXTERNAL(P_sock_errno());
@@ -977,6 +978,7 @@ instrument_listen(instrument_cb cb) {
     g_inst_cb     = cb;
     memset(g_inst_win, 0, sizeof(g_inst_win));
     g_inst_synced = false;
+    g_inst_options_base = options_base;
 
     return E_NONE;
 }

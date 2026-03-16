@@ -257,6 +257,16 @@ log_output(log_cb cb_log, bool tag_separate);
 void
 log_slot(log_level_e level, const char* tag, const char* fmt, va_list params);
 
+/**
+ * @brief                       instrument 消息回调接口定义
+ * @param rid                   发送方节点 ID（本地触发时为 0）
+ * @param chn                   消息通道 (当前用于传输日志时对应 log_level_e)
+ * @param tag                   消息标签
+ * @param txt                   消息文本 (已追加 '\0' 终止符)
+ * @param len                   消息文本长度 (不含 '\0')
+ */
+typedef void(*instrument_cb)(uint16_t rid, uint8_t chn, const char* tag, char *txt, int len);
+
 #ifdef LOG_INSTRUMENT
 
 #ifndef INSTRUMENT_PORT
@@ -291,15 +301,6 @@ void instrument_local(int keep_chn, ...);
  */
 void instrument_remote(void);
 
-/**
- * @brief                       instrument 消息回调接口定义
- * @param rid                   发送方节点 ID（本地触发时为 0）
- * @param chn                   消息通道 (当前用于传输日志时对应 log_level_e)
- * @param tag                   消息标签
- * @param txt                   消息文本 (已追加 '\0' 终止符)
- * @param len                   消息文本长度 (不含 '\0')
- */
-typedef void(*instrument_cb)(uint16_t rid, uint8_t chn, const char* tag, char *txt, int len);
 
 /**
  * @brief                       发送 instrument 消息包 (内部调用)
@@ -315,12 +316,14 @@ void instrument_slot(uint8_t chn, const char* tag, const char* fmt, va_list para
 /**
  * @brief                       启动 instrument 监听
  * @param cb                    消息回调函数，按 seq 顺序交付
+ * @param options_base          instrument 选项基址（0-65535），用于设定该模块的选项索引的起始值，避免与其他模块冲突
+ *                              instrument_enable 的 idx 参数会基于该基址进行偏移
  * @return                      E_NONE 成功，否则返回错误码
  * @note                        内部启动接收线程，处理乱序和丢包
  *                              同时初始化发送端 socket（监听端也可发送）
  *                              丢包时会输出 stderr 警告信息
  */
-ret_t instrument_listen(instrument_cb cb);
+ret_t instrument_listen(instrument_cb cb, uint16_t options_base);
 
 /**
  * @brief                       启用/禁用指定的 instrument 选项
@@ -338,7 +341,14 @@ ret_t instrument_enable(uint16_t idx, bool enable);
  * @return                      true=已启用, false=未启用或索引越界
  */
 bool instrument_enabled(uint16_t idx);
-
+#else
+#define instrument_port(...)    ((void)0)
+#define instrument_local(...)   ((void)0)
+#define instrument_remote()     ((void)0)
+#define instrument_slot(...)    ((void)0)
+#define instrument_listen(...)  ((ret_t)((volatile int){E_NONE}))
+#define instrument_enable(...)  ((ret_t)((volatile int){E_NONE}))
+#define instrument_enabled(...) ((volatile bool){false})
 #endif
 
 static inline void print(const char* fmt, ...) {
