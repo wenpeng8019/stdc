@@ -43,12 +43,23 @@ typedef struct {
     int len;                                         // 0 = 空槽
     uint16_t rid;                                    // 发送方 rid
 } inst_slot_t;
+
+// Per-RID 序号追踪（支持多发送方）
+#define INST_MAX_SENDERS        8
+typedef struct {
+    uint16_t rid;
+    uint16_t next_seq;
+    bool synced;
+} inst_sender_t;
+static inst_sender_t            g_inst_senders[INST_MAX_SENDERS];
+static int                      g_inst_sender_cnt = 0;
+
 static instrument_cb            g_inst_cb     = NULL;
 static uint16_t                 g_inst_options_base = 0;
 static TLS int                  g_inst_in_cb  = 0;                  // 防止回调递归
 static inst_slot_t              g_inst_win[INST_WINDOW_SIZE];
-static uint16_t                 g_inst_next   = 0;                  // 下一个期望 seq
-static bool                     g_inst_synced = false;              // 首包同步标记
+static uint16_t                 g_inst_next   = 0;                  // 下一个期望 seq（全局，用于窗口索引）
+static bool                     g_inst_synced = false;              // 首包同步标记（已废弃，保留兼容）
 
 // 广播模式
 typedef enum {
@@ -1120,6 +1131,28 @@ static int inst_flush(void) {
     return count;
 }
 
+// 查找或创建 sender 条目
+static inst_sender_t* inst_find_sender(uint16_t rid) {
+    // 查找现有
+    for (int i = 0; i < g_inst_sender_cnt; i++) {
+        if (g_inst_senders[i].rid == rid) return &g_inst_senders[i];
+    }
+    // 创建新条目
+    if (g_inst_sender_cnt < INST_MAX_SENDERS) {
+        inst_sender_t *s = &g_inst_senders[g_inst_sender_cnt++];
+        s->rid = rid;
+        s->next_seq = 0;
+        s->synced = false;
+        return s;
+    }
+    // 满了，复用最旧的（LRU近似）
+    inst_sender_t *s = &g_inst_senders[0];
+    s->rid = rid;
+    s->next_seq = 0;
+    s->synced = false;
+    return s;
+}
+
 // 接收线程：循环 recvfrom，按 seq 顺序交付到回调
 static int32_t inst_thread_proc(void *ctx) {
     (void)ctx;
@@ -1144,41 +1177,31 @@ static int32_t inst_thread_proc(void *ctx) {
         // type!=0 未知类型，丢弃
         if (type != 0) continue;
 
+        // 获取该 rid 的序号追踪器
+        inst_sender_t *sender = inst_find_sender(rid);
+
         // 首包同步
-        if (!g_inst_synced) { g_inst_synced = true;
-            g_inst_next = seq; 
+        if (!sender->synced) {
+            sender->synced = true;
+            sender->next_seq = seq;
         }
 
-        int16_t diff = (int16_t)(seq - g_inst_next);
+        int16_t diff = (int16_t)(seq - sender->next_seq);
         if (diff < 0) continue;                     // 旧包/重复
 
-        // 超出窗口 → 强制交付已缓冲包，跳跃到新 seq
+        // 超出窗口 → 警告并跳跃到新 seq
         if (diff >= INST_WINDOW_SIZE) {
-            fprintf(stderr, "inst: lost %d packets (seq %u → %u)\n", (int)diff, g_inst_next, seq);
-            for (int i = 0; i < INST_WINDOW_SIZE; i++) {
-                int slot_idx = (g_inst_next + i) & INST_WINDOW_MASK;
-                if (g_inst_win[slot_idx].len > 0) {
-                    if (g_inst_cb && g_inst_win[slot_idx].len > INST_HDR_SIZE)
-                        inst_deliver(g_inst_win[slot_idx].rid,
-                                     g_inst_win[slot_idx].data,
-                                     g_inst_win[slot_idx].len);  // 传入完整包
-                    g_inst_win[slot_idx].len = 0;
-                }
-            }
-            g_inst_next = seq;
+            fprintf(stderr, "inst: rid=%u lost %d packets (seq %u → %u)\n",
+                    rid, (int)diff, sender->next_seq, seq);
+            sender->next_seq = seq;
             diff = 0;
         }
 
-        // 缓冲到窗口槽
-        int idx = seq & INST_WINDOW_MASK;
-        if (g_inst_win[idx].len == 0) {
-            memcpy(g_inst_win[idx].data, buf, n);
-            g_inst_win[idx].len = n;
-            g_inst_win[idx].rid = rid;
+        // 直接交付（简化：不使用窗口缓冲，保持顺序由发送方保证）
+        if (g_inst_cb && n > INST_HDR_SIZE) {
+            inst_deliver(rid, buf, n);
         }
-
-        // 顺序交付
-        inst_flush();
+        sender->next_seq = seq + 1;
     }
     return 0;
 }
