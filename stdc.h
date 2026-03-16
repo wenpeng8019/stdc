@@ -452,10 +452,11 @@ static inline void print(const char* fmt, ...) {
             if (!*fmt) fmt = va_arg(args, const char*); // 支持 print("I:", fmt, ...) 形式的调用
         }
         else {
-#ifdef LOG_INSTRUMENT            
+#ifdef LOG_INSTRUMENT
+            uint8_t chn = (uint8_t)(*fmt);
             fmt+=2; if (*fmt == ' ') ++fmt;
             if (!*fmt) fmt = va_arg(args, const char*); // 支持 print("E:", fmt, ...) 形式的调用
-            instrument_slot(*fmt, tag, fmt, args);      // 如果指定的 chn 不合法，则视为 instrument 输出
+            instrument_slot(chn, tag, fmt, args);       // 如果指定的 chn 不合法，则视为 instrument 输出
 #endif
             va_end (args);
             return;

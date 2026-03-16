@@ -19,6 +19,12 @@ static char                     g_log_name[64] = {0};               // 日志名
 #define INST_WINDOW_SIZE        64                                  // 接收端滑动窗口大小（必须为 2 的幂）
 #define INST_WINDOW_MASK        (INST_WINDOW_SIZE - 1)
 
+// 组播地址：239.255.77.77 (自定义本地管理组播地址)
+// - 239.0.0.0/8 为本地管理组播范围 (RFC 2365)
+// - 使用组播而非单播的原因：SO_REUSEPORT 对单播是负载均衡（只有一个进程收到），
+//   而组播可确保本机所有监听进程都能收到消息
+#define INST_MCAST_ADDR         0xEFFF4D4D                          // 239.255.77.77
+
 // 运行和状态
 static volatile bool            g_inst_running = false;
 static thd_t                    g_inst_thread  = 0;
@@ -775,9 +781,13 @@ static void inst_cleanup(void) {
 
 static int32_t inst_thread_proc(void *ctx);  // 前向声明
 
-static bool inst_init(void) {
+// 初始化 socket（仅网络，不启动线程）
+// 前置条件：g_inst_sock == P_INVALID_SOCKET（调用处判断）
+// 纯发送场景（instrument_enable/instrument_slot）只需调用此函数
+static bool inst_init_sock(void) {
 
     assert(g_inst_sock == P_INVALID_SOCKET);
+
     g_inst_sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (g_inst_sock == P_INVALID_SOCKET) return false;
 
@@ -800,13 +810,27 @@ static bool inst_init(void) {
         return false;
     }
 
-    // 目标地址：根据模式设置
+    // 组播设置：
+    // - 加入组播组，确保能接收发往该组播地址的消息
+    // - 启用组播回环，使本机发送的消息也能被本机其他进程收到
+    // 注：单播 + SO_REUSEPORT 在 macOS/Linux 上是负载均衡（只有一个进程收到），
+    //     组播是真正的一对多广播，所有加入组的进程都能收到
+    struct ip_mreq mreq;
+    mreq.imr_multiaddr.s_addr = htonl(INST_MCAST_ADDR);
+    mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+    setsockopt(g_inst_sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, (const char*)&mreq, sizeof(mreq));
+    unsigned char loop = 1;
+    setsockopt(g_inst_sock, IPPROTO_IP, IP_MULTICAST_LOOP, (const char*)&loop, sizeof(loop));
+
+    // 目标地址：
+    // - HOST 模式：组播地址（本机所有进程可见）
+    // - REMOTE 模式：广播地址（局域网可见）
     memset(&g_inst_dest, 0, sizeof(g_inst_dest));
     g_inst_dest.sin_family      = AF_INET;
     g_inst_dest.sin_port        = htons(g_inst_port);
     g_inst_dest.sin_addr.s_addr = (g_inst_mode == INST_MODE_REMOTE)
                                     ? htonl(INADDR_BROADCAST)
-                                    : htonl(INADDR_LOOPBACK);  // 127.0.0.1
+                                    : htonl(INST_MCAST_ADDR);  // 组播地址
 
     // 生成随机 rid
     g_inst_rid = (uint16_t)(P_tick_us() ^ (uintptr_t)&g_inst_sock);
@@ -814,16 +838,23 @@ static bool inst_init(void) {
     // 设置接收超时（100ms），供线程周期性检查 g_inst_running
     P_sock_rcvtimeo(g_inst_sock, 100);
 
-    // 启动接收线程（统一处理选项包）
+    atexit(inst_cleanup);
+    return true;
+}
+
+// 启动接收线程（监听场景需要）
+// 前置条件：g_inst_sock 已初始化，g_inst_thread == 0（调用处判断）
+// instrument_listen/instrument_enabled 需要调用此函数以接收其他进程的消息
+static bool inst_start_thread(void) {
+
+    assert(g_inst_sock != P_INVALID_SOCKET);
+    assert(g_inst_thread == 0);
+
     g_inst_running = true;
     if (P_thread(&g_inst_thread, inst_thread_proc, NULL, P_THD_BACKGROUND, 0) != E_NONE) {
         g_inst_running = false;
-        P_sock_close(g_inst_sock);
-        g_inst_sock = P_INVALID_SOCKET;
         return false;
     }
-
-    atexit(inst_cleanup);
     return true;
 }
 
@@ -849,18 +880,21 @@ static void inst_bits_reserve(uint16_t byte_idx) {
     g_inst_bits_len = need;
 }
 
-// 发送 type=1 包：offset(2) + byte(1)
+// 发送 type=1 包：header(7) + offset(2) + byte(1)
+// 包格式与 type=0 统一使用 INST_HDR_SIZE header，便于接收端统一处理
 static void inst_send_bits(uint16_t byte_idx) {
     if (g_inst_sock == P_INVALID_SOCKET) return;
     if (byte_idx >= g_inst_bits_len) return;
 
     uint8_t pkt[INST_HDR_SIZE + 3];
-    nwrite_s(pkt, g_inst_rid);
-    uint16_t seq = g_inst_seq++;
-    nwrite_s(pkt + 2, seq);
+    nwrite_s(pkt, g_inst_rid);                      // rid
+    nwrite_s(pkt + 2, g_inst_seq++);                // seq
     pkt[4] = 1;                                     // type=1 选项包
-    nwrite_s(pkt + 5, byte_idx);
-    pkt[7] = g_inst_bits[byte_idx];
+    pkt[5] = 0;                                     // chn（未使用，占位）
+    pkt[6] = 0;                                     // tag_len（未使用，占位）
+    // payload: offset(2) + byte(1)
+    nwrite_s(pkt + INST_HDR_SIZE, byte_idx);
+    pkt[INST_HDR_SIZE + 2] = g_inst_bits[byte_idx];
 
     sendto(g_inst_sock, (const char*)pkt, sizeof(pkt), 0,
            (struct sockaddr*)&g_inst_dest, sizeof(g_inst_dest));
@@ -869,7 +903,8 @@ static void inst_send_bits(uint16_t byte_idx) {
 ret_t
 instrument_enable(uint16_t idx, bool enable) {
 
-    if (g_inst_sock == P_INVALID_SOCKET && !inst_init())
+    // 发送操作：只需初始化 socket，不启动接收线程
+    if (g_inst_sock == P_INVALID_SOCKET && !inst_init_sock())
         return E_EXTERNAL(P_sock_errno());
 
     idx += g_inst_options_base;
@@ -888,7 +923,13 @@ instrument_enable(uint16_t idx, bool enable) {
 }
 
 bool
-instrument_enabled(uint16_t idx) { idx += g_inst_options_base;
+instrument_enabled(uint16_t idx) {
+
+    // 监听操作：需要启动接收线程以接收其他进程的选项包
+    if (g_inst_sock == P_INVALID_SOCKET && !inst_init_sock()) return false;
+    if (g_inst_thread == 0 && !inst_start_thread()) return false;
+
+    idx += g_inst_options_base;
     uint16_t byte_idx = idx / 8;
     if (byte_idx >= g_inst_bits_len) return false;
     return (g_inst_bits[byte_idx] & (1u << (idx % 8))) != 0;
@@ -918,7 +959,9 @@ inst_send_buf(uint8_t chn, char* buf, int tag_len, int text_len) {
     if (g_inst_mode == INST_MODE_LOCAL) {
         if (!(g_inst_keep_chn[chn / 32] & (1u << (chn % 32)))) return;
     }
-    if (g_inst_sock == P_INVALID_SOCKET && !inst_init()) return;
+    
+    // 发送操作：只需初始化 socket，不启动接收线程
+    if (g_inst_sock == P_INVALID_SOCKET && !inst_init_sock()) return;
 
     // 写入固定 header (7 bytes)
     uint8_t *pkt = (uint8_t*)buf;
@@ -972,7 +1015,10 @@ instrument_slot(uint8_t chn, const char* tag, const char* fmt, va_list params) {
 ret_t
 instrument_listen(instrument_cb cb, uint16_t options_base) {
 
-    if (g_inst_sock == P_INVALID_SOCKET && !inst_init())
+    // 监听操作：需要启动接收线程
+    if (g_inst_sock == P_INVALID_SOCKET && !inst_init_sock())
+        return E_EXTERNAL(P_sock_errno());
+    if (g_inst_thread == 0 && !inst_start_thread())
         return E_EXTERNAL(P_sock_errno());
 
     g_inst_cb     = cb;
@@ -1029,18 +1075,25 @@ static void inst_handle_bits(uint8_t *payload, int len) {
     }
 }
 
-// 解析并交付一个数据包负载到回调
-// 协议: chn(1) + tag_len(1) + tag + \0 + text
-static void inst_deliver(uint16_t rid, uint8_t *payload, int len) {
-    if (!g_inst_cb || len < 2) return;              // 至少 chn+tag_len
+// 解析并交付一个数据包到回调
+// pkt: 完整数据包（包含 header）
+// len: 包长度
+// 协议: header(7) = rid(2)+seq(2)+type(1)+chn(1)+tag_len(1)
+//       payload   = tag + \0 + text
+static void inst_deliver(uint16_t rid, uint8_t *pkt, int len) {
+    assert(g_inst_cb);
+    if (len < INST_HDR_SIZE + 2) return;  // 至少 header + tag(1) + \0
 
-    uint8_t chn     = payload[0];
-    uint8_t tag_len = payload[1];
-    int text_len    = len - 2 - tag_len - 1;        // 从包长计算（-1 是 \0）
+    uint8_t chn     = pkt[5];                       // header 中的 chn
+    uint8_t tag_len = pkt[6];                       // header 中的 tag_len
+    
+    uint8_t *payload = pkt + INST_HDR_SIZE;
+    int payload_len  = len - INST_HDR_SIZE;
+    int text_len     = payload_len - tag_len - 1;   // -1 是 \0
 
     if (text_len < 0) return;                       // 数据不完整
 
-    char *tag  = (char*)(payload + 2);              // tag 已有 \0 结尾
+    char *tag  = (char*)payload;                    // tag 已有 \0 结尾
     char *text = tag + tag_len + 1;                 // 跳过 \0
     text[text_len] = '\0';                          // 安全：inst_slot_t.data 有 +1 余量
 
@@ -1057,12 +1110,12 @@ static int inst_flush(void) {
         uint8_t *pkt = g_inst_win[idx].data;
         int pkt_len  = g_inst_win[idx].len;
         uint16_t rid = g_inst_win[idx].rid;
-        if (pkt_len > INST_HDR_SIZE)
-            inst_deliver(rid, pkt + INST_HDR_SIZE, pkt_len - INST_HDR_SIZE);
+        if (g_inst_cb && pkt_len > INST_HDR_SIZE)
+            inst_deliver(rid, pkt, pkt_len);  // 传入完整包
 
         g_inst_win[idx].len = 0;
         g_inst_next++;
-        count++;
+        count++;;
     }
     return count;
 }
@@ -1105,10 +1158,10 @@ static int32_t inst_thread_proc(void *ctx) {
             for (int i = 0; i < INST_WINDOW_SIZE; i++) {
                 int slot_idx = (g_inst_next + i) & INST_WINDOW_MASK;
                 if (g_inst_win[slot_idx].len > 0) {
-                    if (g_inst_win[slot_idx].len > INST_HDR_SIZE)
+                    if (g_inst_cb && g_inst_win[slot_idx].len > INST_HDR_SIZE)
                         inst_deliver(g_inst_win[slot_idx].rid,
-                                     g_inst_win[slot_idx].data + INST_HDR_SIZE,
-                                     g_inst_win[slot_idx].len  - INST_HDR_SIZE);
+                                     g_inst_win[slot_idx].data,
+                                     g_inst_win[slot_idx].len);  // 传入完整包
                     g_inst_win[slot_idx].len = 0;
                 }
             }
