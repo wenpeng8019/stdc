@@ -150,7 +150,7 @@ void ARGS_usage(const char* pos_desc, const char* usage_ex) {
 
 int ARGS_parse(int argc, char** argv, ...) {
 
-    if (g_args_def) return 1;
+    if (g_args_def) return g_pos_count;
 
     va_list args; va_start(args, argv);
     arg_def_st* def; int req_count = 0;  // 必选参数计数
@@ -198,6 +198,16 @@ int ARGS_parse(int argc, char** argv, ...) {
 
             if (def->type == ARG_BOOL) {
                 def->var->i64 = 1;
+            } else if (def->type == ARG_PRE) {
+                typedef void (*pre_cb)(const char*);
+                pre_cb cb = (pre_cb)(uintptr_t)def->var;
+                /* 可选参数值：下一个 argv 存在且不以 '-' 开头时视为参数 */
+                if (i + 1 < argc && argv[i + 1][0] != '-') {
+                    argv[w++] = argv[++i];
+                    cb(argv[i]);
+                } else {
+                    cb(NULL);
+                }
             } else if (def->type == ARG_LS) {
                 if (i + 1 >= argc) {
                     fprintf(stderr, "Error: Option '%s' requires a value\n", arg);
@@ -242,6 +252,16 @@ int ARGS_parse(int argc, char** argv, ...) {
 
                 if (def->type == ARG_BOOL) {
                     def->var->i64 = 1;
+                } else if (def->type == ARG_PRE) {
+                    typedef void (*pre_cb)(const char*);
+                    pre_cb cb = (pre_cb)(uintptr_t)def->var;
+                    if (i + 1 < argc && argv[i + 1][0] != '-') {
+                        argv[w++] = argv[++i];
+                        cb(argv[i]);
+                    } else {
+                        cb(NULL);
+                    }
+                    break;
                 } else if (def->type == ARG_LS) {
                     if (i + 1 >= argc) {
                         fprintf(stderr, "Error: Option '-%c' requires a value\n", c);
@@ -367,13 +387,22 @@ int ARGS_print(const char* arg0) {
             switch (def->type) {
                 case ARG_INT:   type_str = "<int>"; break;
                 case ARG_FLOAT: type_str = "<float>"; break;
-                case ARG_BOOL:  type_str = ""; break;
+                case ARG_BOOL:  type_str = "<bool>"; break;
+                case ARG_PRE:   type_str = "<pre>"; break;
                 case ARG_STR:   type_str = "<string>"; break;
                 case ARG_DIR:   type_str = "<dir>"; break;
                 case ARG_LS:    type_str = "<list>"; break;
             }
-            printf("  -%c, --%-*s  %-10s %s%s\n", def->s, max_l_len, def->l, type_str,
-                   def->req ? "\033[31m[required]\033[0m " : "[optional] ", P_LA(def->desc));
+            const char* l_name = def->l ? def->l : "";
+            if (def->s && def->l)
+                printf("  -%c, --%-*s  %-10s %s%s\n", def->s, max_l_len, l_name, type_str,
+                       def->req ? "\033[31m[required]\033[0m " : "[optional] ", P_LA(def->desc));
+            else if (def->s)
+                printf("  -%c  %-*s    %-10s %s%s\n", def->s, max_l_len, "", type_str,
+                       def->req ? "\033[31m[required]\033[0m " : "[optional] ", P_LA(def->desc));
+            else
+                printf("      --%-*s  %-10s %s%s\n", max_l_len, l_name, type_str,
+                       def->req ? "\033[31m[required]\033[0m " : "[optional] ", P_LA(def->desc));
         }
     }
 

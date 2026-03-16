@@ -523,8 +523,10 @@ typedef enum arg_type {
     ARG_INT,
     ARG_BOOL,
     ARG_STR,
-    ARG_DIR,                    ///< 目录路径，自动规范化：展开~、移除末尾/、合并//、处理/./
-    ARG_LS,
+    ARG_DIR,                    // 目录路径：自动规范化：展开~、移除末尾/、合并//、处理/./
+    ARG_LS,                     // 字符串列表：逗号分隔的字符串数组。此时 ARGS_xxx.ls[i] 可获取列表项; ARGS_ls_count(&ARGS_xxx) 可获取列表数量
+    ARG_PRE,                    // 预处理回调：在解析命令行参数过程中触发。常用于指定语言选项，可在执行 show_help 之前执行
+                                // 回调接口定义：void prev_cb(char* argv)
 } arg_type_e;
 
 /**
@@ -548,10 +550,10 @@ typedef enum arg_type {
  * @note INT/FLOAT 标记为必选时，无法区分"未设置"和"设置为0"
  */
 typedef union arg_var {
-    const char*  str;           ///< ARG_STR, ARG_DIR
-    int64_t      i64;           ///< ARG_BOOL, ARG_INT
-    double       f64;           ///< ARG_FLOAT
-    const char** ls;            ///< ARG_LS，用 ARGS_ls_count() 获取数量
+    const char*  str;           // ARG_STR, ARG_DIR
+    int64_t      i64;           // ARG_BOOL, ARG_INT
+    double       f64;           // ARG_FLOAT
+    const char** ls;            // ARG_LS，用 ARGS_ls_count() 获取数量
 } arg_var_st;
 
 typedef struct arg_def {
@@ -564,7 +566,6 @@ typedef struct arg_def {
     arg_var_st* var;
     struct arg_def* next;
 } arg_def_st;
-
 
 #define ARGS_DEF(req, name, type, s_cmd, l_cmd, desc)   \
 extern arg_var_st ARGS_##name;                          \
@@ -593,6 +594,12 @@ static arg_def_st ARGS_DEF_##name = {                   \
 #define ARGS_Sv(dft, name, s_cmd, l_cmd, desc)  ARGS_DFT({.str=(dft)}, name, STR, s_cmd, l_cmd, desc)
 #define ARGS_Dv(dft, name, s_cmd, l_cmd, desc)  ARGS_DFT({.str=(dft)}, name, DIR, s_cmd, l_cmd, desc)
 #define ARGS_Lv(dft, name, s_cmd, l_cmd, desc)  ARGS_DFT({.ls=(dft)}, name, LS, s_cmd, l_cmd, desc)
+
+#define ARGS_PRE(cb_pre, name, s_cmd, l_cmd, desc)      \
+static arg_def_st ARGS_DEF_##name = {                   \
+    #name, desc, ARG_PRE, s_cmd, l_cmd, false,          \
+    (arg_var_st*)cb_pre, NULL                           \
+}
 
 #define ARGS(name) extern arg_var_st ARGS_##name
 
