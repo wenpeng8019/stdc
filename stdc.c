@@ -772,7 +772,14 @@ void log_slot(log_level_e level, const char *tag, const char *fmt, va_list param
     // 对于标准输出
     if (cb_log == (log_cb)-1) {
         if (total > 0 && out[total - 1] == '\n') out[--total] = 0; // 移除末尾换行符
-        printf("%s\n", out);
+        switch (level) {
+        case LOG_SLOT_FATAL: printf(P_PURPLE("%s\n"), out); break;
+        case LOG_SLOT_ERROR: printf(P_RED("%s\n"), out); break;
+        case LOG_SLOT_WARN:  printf(P_YELLOW("%s\n"), out); break;
+        case LOG_SLOT_VERBOSE: printf(P_GRAY("%s\n"), out); break;
+        case LOG_SLOT_DEBUG: printf(P_CYAN("%s\n"), out); break;
+        default: printf("%s\n", out); break;
+        }
     }
     else if (cb_log == (log_cb)-2) {
         log_write(level, tag, out, total);
@@ -855,7 +862,11 @@ static void inst_cleanup(void) {
     }
 }
 
-static int32_t inst_thread_proc(void *ctx);  // 前向声明
+void
+instrument_port(uint16_t port) {
+    assert(g_inst_sock == P_INVALID_SOCKET);        // 必须在首次使用前调用
+    g_inst_port = port;
+}
 
 // 初始化 socket（仅网络，不启动线程）
 // 前置条件：g_inst_sock == P_INVALID_SOCKET（调用处判断）
@@ -918,6 +929,8 @@ static bool inst_init_sock(void) {
     return true;
 }
 
+static int32_t inst_thread_proc(void *ctx);  // 前向声明
+
 // 启动接收线程（监听场景需要）
 // 前置条件：g_inst_sock 已初始化，g_inst_thread == 0（调用处判断）
 // instrument_listen/instrument_enabled 需要调用此函数以接收其他进程的消息
@@ -932,12 +945,6 @@ static bool inst_start_thread(void) {
         return false;
     }
     return true;
-}
-
-void
-instrument_port(uint16_t port) {
-    assert(g_inst_sock == P_INVALID_SOCKET);        // 必须在首次使用前调用
-    g_inst_port = port;
 }
 
 // ---- 选项 bitset ----
