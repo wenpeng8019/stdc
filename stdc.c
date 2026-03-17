@@ -1,14 +1,20 @@
 
 #pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunknown-pragmas"
 #pragma ide diagnostic ignored "OCUnusedGlobalDeclarationInspection"
 
 #include "stdc.h"
 
 lang_cb                         P_lang;
 
-static log_cb                   g_cb_log = (log_cb)-1;              // 默认 (-1) stdout 输出
-static bool                     g_tag_separate = false;
-static char                     g_log_name[64] = {0};               // 日志名称（从可执行文件名提取）
+static char                     g_log_name[64];                     // 系统日志名称（从可执行文件名提取）
+static bool                     g_log_sys;
+static FILE*                    g_log_fp = NULL;                    // 日志文件指针（默认为 stderr）
+static void*                    g_cache_head, *g_cache_rear;
+static uint32_t                 g_line_count;
+static P_mutex_t                g_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+
 
 #ifdef LOG_INSTRUMENT
 
@@ -414,7 +420,9 @@ int ARGS_print(const char* arg0) {
 // 系统日志（平台适配层）
 ///////////////////////////////////////////////////////////////////////////////
 
-#if P_DARWIN
+#if P_WIN
+#include <io.h>
+#elif P_DARWIN
 #include <os/log.h>
 static os_log_t g_log_handle;
 #elif defined(__ANDROID__)
@@ -432,7 +440,8 @@ static bool g_log_opened = false;
  * @return 日志名称字符串
  */
 static const char* get_log_name(void) {
-    if (g_log_name[0]) return g_log_name;
+
+    if (*g_log_name) return g_log_name;
     
     // 获取可执行文件路径
     char exe_path[1024];
@@ -516,8 +525,6 @@ static void log_cleanup(void) {
  */
 static void log_write(log_level_e level, const char* tag, char* text, int len) {
     (void)len;  // unused
-    
-    if (!tag) tag = get_log_name();
     if (!text) return;
 
 #if P_WIN
@@ -528,6 +535,7 @@ static void log_write(log_level_e level, const char* tag, char* text, int len) {
 
 #elif P_DARWIN
 
+    (void)tag;
     static const os_log_type_t s_level[] = {
         OS_LOG_TYPE_DEBUG,   // VERBOSE
         OS_LOG_TYPE_DEBUG,   // DEBUG
@@ -556,7 +564,8 @@ static void log_write(log_level_e level, const char* tag, char* text, int len) {
     __android_log_write(s_level[level], tag, text);
 
 #elif defined(__QNX__)
-
+    
+    (void)tag;
     static const int s_level[] = {
         SLOG2_DEBUG2,   // VERBOSE
         SLOG2_DEBUG1,   // DEBUG
@@ -573,6 +582,7 @@ static void log_write(log_level_e level, const char* tag, char* text, int len) {
 
 #elif P_LINUX
 
+    (void)tag;
     static const int s_level[] = {
         LOG_DEBUG,   // VERBOSE
         LOG_DEBUG,   // DEBUG
@@ -590,49 +600,65 @@ static void log_write(log_level_e level, const char* tag, char* text, int len) {
 #endif
 }
 
-///////////////////////////////////////////////////////////////////////////////
+//-----------------------------------------------------------------------------
 
-void log_output(log_cb cb_log, bool tag_separate) {
-    
-    log_cb old_cb = g_cb_log;
-    
-    // 如果设置为 NULL，清理资源并重置为默认
-    if (cb_log == NULL) {
-        if (old_cb == log_write) {
+void log_output(cstr_t filename, uint32_t sz_max) {
+
+    if (g_log_fp) {
+
+        fflush(g_log_fp);
+
+        if (g_log_fp != stderr) {
+#if P_WIN
+            HANDLE hFile = (HANDLE)_get_osfhandle(_fileno(g_log_fp));
+            if (hFile != INVALID_HANDLE_VALUE)
+                FlushFileBuffers(hFile);
+#else
+            fsync(fileno(g_log_fp));
+#endif
+            fclose(g_log_fp);
+        }
+
+        if (!filename) {
+            g_log_fp = NULL;
+            P_mutex_final(&g_cache_mutex);
+
+            if (g_log_sys) { g_log_sys = false;
+                log_cleanup();
+            }
+            return;
+        }
+    }
+    else if (!filename) {
+        if (g_log_sys) { g_log_sys = false;
             log_cleanup();
         }
-        g_cb_log = (log_cb)-1;
-        g_tag_separate = false;
         return;
     }
-    
-    // 如果设置为 -2，转换为 log_write
-    if (cb_log == (log_cb)-2) {
-        cb_log = log_write;
+    else P_mutex_init(&g_cache_mutex);
+
+    g_log_fp = fopen(filename, "a");
+    if (!g_log_fp) {
+        // fprintf(stderr, "Error opening log file '%s'\n", filename);
+        g_log_fp = (FILE*)-1;
     }
-    
-    // 如果从其他状态切换到 log_write，需要初始化
-    if (cb_log == log_write && old_cb != log_write) {
-        log_init();
-    }
-    // 如果从 log_write 切换到其他，需要清理
-    else if (old_cb == log_write && cb_log != log_write) {
-        log_cleanup();
-    }
-    
-    g_cb_log = cb_log;
-    g_tag_separate = tag_separate;
 }
 
-void log_slot(log_level_e level, const char *tag, const char *fmt, va_list params) {
+//-----------------------------------------------------------------------------
+
+void log_slot(log_level_e level, const char *tag, const char *fmt, va_list params, log_cb cb_log, bool pre_tag) {
+
+    if (cb_log == (log_cb)-2) {
+        if (!g_log_sys) { g_log_sys = true; log_init(); }
+        #if P_WIN || defined(__ANDROID__)
+            pre_tag = false;
+        #else
+            pre_tag = true;
+        #endif
+    }
 
     static __thread char        g_line[LOG_HDR_RESERVE + 256 + LOG_LINE_MAX];
     static __thread int         g_logging = -1;         // -1: 默认模式，0: 开启缓存模式（缓存内容为空），>0: 缓存模式且已写入内容
-#ifndef LOG_FILE_DISABLED
-    static void*                g_cache_head, *g_cache_rear;
-    static uint32_t             g_line_count;
-    static pthread_mutex_t      g_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
-#endif
     char* const                 buf = g_line + LOG_HDR_RESERVE + 256;     // 日志输出起始位置
 
     // 如果 tag 为空，表示输出日志到缓存
@@ -692,8 +718,7 @@ void log_slot(log_level_e level, const char *tag, const char *fmt, va_list param
 
         inst_send_buf((uint8_t)level, out - INST_HDR_SIZE, m, n);
 
-        if (g_tag_separate) out = buf; 
-        else {
+        if (pre_tag) {
             if (tag_len >= 256) { int shift = tag_len - 255;
                 int max_n = LOG_LINE_MAX - 1 - shift;       // 移动后的最大 text 长度 (-1 给 \0)
                 if (max_n < 0) max_n = 0;
@@ -702,7 +727,7 @@ void log_slot(log_level_e level, const char *tag, const char *fmt, va_list param
                 memcpy(buf - 1, tag + 255, shift);          // 填入 tag 剩余部分 (从 out[255] 开始)
             }
             out[tag_len] = ' ';
-        }
+        } else out = buf;
     }
     #else
     {
@@ -710,8 +735,7 @@ void log_slot(log_level_e level, const char *tag, const char *fmt, va_list param
         int text_max = LOG_LINE_MAX;                        // text 可用空间
 
         // 设置输出位置
-        if (g_tag_separate) out = buf;
-        else {
+        if (pre_tag) {
             int m = (tag_len < 256) ? tag_len : 255;
             out = buf - m - 1;
             memcpy(out, tag, m);
@@ -724,7 +748,7 @@ void log_slot(log_level_e level, const char *tag, const char *fmt, va_list param
                 text = buf + shift;                         // text 起始位置改变
             }
             out[tag_len] = ' ';
-        }
+        } else out = buf;
 
         // 格式化 fmt 到 text
         if (n < text_max) {
@@ -739,64 +763,69 @@ void log_slot(log_level_e level, const char *tag, const char *fmt, va_list param
     int total = (out == buf) ? n : tag_len + 1 + n;  // 总输出长度
 
     // 对于标准输出
-    if (g_cb_log == (log_cb)-1) {
+    if (cb_log == (log_cb)-1) {
         if (total > 0 && out[total - 1] == '\n') out[--total] = 0; // 移除末尾换行符
         printf("%s\n", out);
     }
+    else if (cb_log == (log_cb)-2) {
+        log_write(level, tag, out, total);
+    }
     // 对于回调（包括系统日志）
-    else if (g_cb_log) {
-        g_cb_log(level, g_tag_separate ? tag : NULL, out, total);
+    else if (cb_log) {
+        cb_log(level, pre_tag ? NULL : tag, out, total);
     }
 
-#ifndef LOG_FILE_DISABLED
+    if (g_log_fp) {
 
-    pthread_mutex_lock(&g_cache_mutex);
+#if 0
+        pthread_mutex_lock(&g_cache_mutex);
 
-      static bool log_append = false;
-      static char log_fn[256];
-      if (!log_append) {
-          for(int i=0;;) {
-              sprintf(log_fn, "%s/%s%d.txt", LOG_OUTPUT_PATH, get_log_name(), ++i);
-              if (access(log_fn, F_OK) < 0) break;
-          }
-      }
+        static bool log_append = false;
+        static char log_fn[256];
+        if (!log_append) {
+            for(int i=0;;) {
+                sprintf(log_fn, "%s/%s%d.txt", LOG_OUTPUT_PATH, get_log_name(), ++i);
+                if (access(log_fn, F_OK) < 0) break;
+            }
+        }
 
-      FILE* fp = fopen(log_fn, log_append?"a":"w");
-      if (fp) {
+        FILE* fp = fopen(log_fn, log_append?"a":"w");
+        if (fp) {
 
-          if (g_cache_head) {
-              do {
-                  void** item = (void**)g_cache_head;
-                  fputs((char*)(item+1), fp);
-                  g_cache_head = *item;
-                  free(item);
-              }
-              while (g_cache_head);
-              g_cache_rear = NULL;
-              g_line_count = 0;
-          }
-          fprintf(fp, "%s\n", out);
-          fclose(fp);
+            if (g_cache_head) {
+                do {
+                    void** item = (void**)g_cache_head;
+                    fputs((char*)(item+1), fp);
+                    g_cache_head = *item;
+                    free(item);
+                }
+                while (g_cache_head);
+                g_cache_rear = NULL;
+                g_line_count = 0;
+            }
+            fprintf(fp, "%s\n", out);
+            fclose(fp);
 
-          log_append = true;
-      }
-      else {
+            log_append = true;
+        }
+        else {
 
-          void** item = (void**)malloc(total + 2/* \n\0 */ + sizeof(void*)); *item = NULL;
-          sprintf((char*)(item+1), "%s\n", out);
-          if (g_cache_rear) *(void**)g_cache_rear = item;
-          else g_cache_head = item;
-          g_cache_rear = item;
+            void** item = (void**)malloc(total + 2/* \n\0 */ + sizeof(void*)); *item = NULL;
+            sprintf((char*)(item+1), "%s\n", out);
+            if (g_cache_rear) *(void**)g_cache_rear = item;
+            else g_cache_head = item;
+            g_cache_rear = item;
 
-          if (++g_line_count > 1000) {
-              void* next = *(void**)g_cache_head;
-              free(g_cache_head);
-              g_cache_head = next;
-          }
-      }
+            if (++g_line_count > 1000) {
+                void* next = *(void**)g_cache_head;
+                free(g_cache_head);
+                g_cache_head = next;
+            }
+        }
 
-      pthread_mutex_unlock(&g_cache_mutex);
+        pthread_mutex_unlock(&g_cache_mutex);
 #endif
+    }
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1238,4 +1267,5 @@ static int32_t inst_thread_proc(void *ctx) {
 #endif
 
 ///////////////////////////////////////////////////////////////////////////////
+#pragma ide diagnostic pop
 #pragma clang diagnostic pop

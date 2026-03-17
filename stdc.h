@@ -196,7 +196,7 @@ extern lang_cb                  P_lang;
 #endif
 
 #ifndef LOG_DEF
-#define LOG_DEF             LOG_SLOT_NONE
+#define LOG_DEF             LOG_SLOT_DEBUG
 #endif
 
 #ifndef LOG_TAG_MAX
@@ -212,35 +212,44 @@ extern lang_cb                  P_lang;
 #define LOG_TAG_R           "]"
 #endif
 
-#define LOG_LINE_MAX        2048
-
-#ifndef LOG_OUTPUT_FILE
-#define LOG_FILE_DISABLED
+#ifndef LOG_TAG_P
+#define LOG_TAG_P           false
 #endif
 
+#define LOG_LINE_MAX        2048
+
 typedef enum {
-    LOG_SLOT_VERBOSE = 0,                            /* 任何信息（常用于输出说明文档） */
-    LOG_SLOT_DEBUG,                                  /* 用于程序调试 */
-    LOG_SLOT_INFO,                                   /* 运行状态 */
-    LOG_SLOT_WARN,                                   /* 警告信息。既可能会产生问题，或无法达到预期 */
-    LOG_SLOT_ERROR,                                  /* 不应该发生的错误，但不影响程序继续运行 */
-    LOG_SLOT_FATAL,                                  /* 导致程序无法再继续运行的错误 */
-    LOG_SLOT_NONE,
+    LOG_SLOT_NONE = 0,
+    LOG_SLOT_FATAL,                                 /* 导致程序无法再继续运行的错误 */
+    LOG_SLOT_ERROR,                                 /* 不应该发生的错误，但不影响程序继续运行 */
+    LOG_SLOT_WARN,                                  /* 警告信息。既可能会产生问题，或无法达到预期 */
+    LOG_SLOT_INFO,                                  /* 运行状态 */
+    LOG_SLOT_DEBUG,                                 /* 用于程序调试 */
+    LOG_SLOT_VERBOSE,                               /* 任何信息（常用于输出说明文档） */
 } log_level_e;
 
 typedef void(*log_cb)(log_level_e level, const char* tag, char *txt, int len);
 
 /**
- * @brief 设置日志输出目标
- * @param cb_log 回调函数指针或特殊值：
+ * @brief 定义日志输出目标
+ * @note 几个特殊值：
  *   - (log_cb)-1: 输出到 stdout（默认）
  *   - (log_cb)-2: 输出到系统日志（os_log/syslog/OutputDebugString等）
- *   - NULL: 清理日志资源
- *   - 其他: 自定义回调函数
- * @param tag_separate 是否分离tag（传递给回调时tag是否独立）
  */
+#ifndef LOG_CALLBACK
+#define LOG_CALLBACK        ((log_cb)-1)
+#endif
+
+#ifndef LOG_LEVEL
+#ifndef NDEBUG
+#define LOG_LEVEL           LOG_SLOT_DEBUG
+#else
+#define LOG_LEVEL           LOG_SLOT_INFO
+#endif
+#endif
+
 void
-log_output(log_cb cb_log, bool tag_separate);
+log_output(cstr_t filename, uint32_t sz_max);
 
 /**
  * @brief 日志输出
@@ -253,9 +262,10 @@ log_output(log_cb cb_log, bool tag_separate);
  *        即如果 fmt 以 '% ' 开头，即 '%' + 空格，则视为 fmt 是一个非格式化字符串
  *        此时会直接将 fmt 中的内容原样输出，相当于 printf("%s", fmt + 2)
  * @param ... 可变参数
+ * @param pre_tag 将 tag 作为日志内容的一部分，先于日志文本输出。而不是单独作为标签参数传递给回调函数
  */
 void
-log_slot(log_level_e level, const char* tag, const char* fmt, va_list params);
+log_slot(log_level_e level, const char* tag, const char* fmt, va_list params, log_cb cb_log, bool pre_tag);
 
 /**
  * @brief                       instrument 消息回调接口定义
@@ -435,10 +445,10 @@ static inline void print(const char* fmt, ...) {
         // + 注意，换成模式不支持 print(":", fmt, ...) 形式的调用
         //   因为 print(":") 被视为只开启缓存模式，但不输出任何内容
 
-        if (s_begin) log_slot(LOG_SLOT_NONE, NULL, NULL, args); // 如果之前已经开启缓存，则清空缓存，从头开始
+        if (s_begin) log_slot(LOG_SLOT_NONE, NULL, NULL, args, (log_cb)LOG_CALLBACK, LOG_TAG_P); // 如果之前已经开启缓存，则清空缓存，从头开始
         else { s_begin = true;
             if (*fmt == ' ') ++fmt;                     // 忽略 1 个且只忽略 1 个空格（即允许多个空格作为缩进）
-            log_slot(LOG_SLOT_NONE, NULL, fmt, args);
+            log_slot(LOG_SLOT_NONE, NULL, fmt, args, (log_cb)LOG_CALLBACK, LOG_TAG_P);
         }
         va_end(args);
         return;
@@ -446,14 +456,14 @@ static inline void print(const char* fmt, ...) {
 
     if (fmt[1] == ':') {
         s_begin = false;                                // 只要指定 chn 标识，就会关闭缓存模式
-        const char *q="VDIWEF", *p = strchr(q, *fmt);
-        if (p) { chn = (uint8_t)(p - q); 
+        const char *q="FEWIDV", *p = strchr(q, *fmt);
+        if (p) { chn = (uint8_t)(p - q) + 1;
             fmt+=2; if (*fmt == ' ') ++fmt;             // 忽略 1 个且只忽略 1 个空格（即允许多个空格作为缩进）
             if (!*fmt) fmt = va_arg(args, const char*); // 支持 print("I:", fmt, ...) 形式的调用
         }
         else {
 #ifdef LOG_INSTRUMENT
-            uint8_t chn = (uint8_t)(*fmt);
+            chn = (uint8_t)(*fmt);
             fmt+=2; if (*fmt == ' ') ++fmt;
             if (!*fmt) fmt = va_arg(args, const char*); // 支持 print("E:", fmt, ...) 形式的调用
             instrument_slot(chn, tag, fmt, args);       // 如果指定的 chn 不合法，则视为 instrument 输出
@@ -463,10 +473,11 @@ static inline void print(const char* fmt, ...) {
         }
     }
 
-    if (s_begin)
-        log_slot(LOG_SLOT_NONE, NULL, fmt, args);
-    else if (chn < LOG_SLOT_NONE)                       // 默认级别为 NONE 时，则默认不输出任何内容
-        log_slot(chn, tag, fmt, args);
+    if (s_begin) log_slot(LOG_SLOT_NONE, NULL, fmt, args, (log_cb)LOG_CALLBACK, LOG_TAG_P);
+    else { instrument_slot(chn, tag, fmt, args);
+        if (chn <= LOG_LEVEL)
+            log_slot(chn, tag, fmt, args, (log_cb)LOG_CALLBACK, LOG_TAG_P);
+    }
 
     va_end (args);
 }
