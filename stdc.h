@@ -143,8 +143,9 @@ typedef int32_t                 ret_t;
 #define E_NONE_CONTEXT          (-9)                /* 不具备可运行的状态。常见的就是没有初始化或启动 */
 #define E_NONE_RELEASED         (-10)               /* 当前（资源）项未被释放，无法被析构或再次分配 */
 #define E_BUSY                  (-11)               /* 当前无法运行或答复，需要稍后重试 */
-#define E_NO_PERMISSION         (-12)               /* 无权限访问 */
-#define E_NO_SUPPORT            (-13)               /* 程序不支持（未设计）该功能 */
+#define E_TIMEOUT               (-12)               /* 超时 */
+#define E_NO_PERMISSION         (-13)               /* 无权限访问 */
+#define E_NO_SUPPORT            (-14)               /* 程序不支持（未设计）该功能 */
 #define E_CUSTOM(e)             (-100-e)            /* 自定义错误 */
 
 #define E_EXTERNAL(e)           (-((e)<<8))         /* 外部（其他系统）定义的错误 */
@@ -269,6 +270,8 @@ log_output(cstr_t filename, uint32_t sz_max);
 void
 log_slot(log_level_e level, const char* tag, const char* fmt, va_list params, log_cb cb_log, bool pre_tag);
 
+//-----------------------------------------------------------------------------
+
 /**
  * @brief                       instrument 消息回调接口定义
  * @param rid                   发送方节点 ID（本地触发时为 0）
@@ -284,6 +287,8 @@ typedef void(*instrument_cb)(uint16_t rid, uint8_t chn, const char* tag, char *t
 #ifndef INSTRUMENT_PORT
 #define INSTRUMENT_PORT      1980
 #endif
+
+#define INSTRUMENT_CTRL      255
 
 /**
  * @brief                       设置 instrument 通信端口
@@ -353,15 +358,42 @@ ret_t instrument_enable(uint16_t idx, bool enable);
  * @return                      true=已启用, false=未启用或索引越界
  */
 bool instrument_enabled(uint16_t idx);
+
+/**
+ * @brief                       阻塞等待对端调用 instrument_continue
+ * @param waiting               本方名称（广播给对端，作为 WAIT 消息内容）
+ * @param from                  期望的应答方名称（NULL 或空串表示任意方均可中断）
+ * @param timeout_ms            超时时间（毫秒），0 表示无限等待
+ * @return                      E_NONE 收到 continue，E_TIMEOUT 超时
+ * @note                        内部定期广播 WAIT 包，收到匹配的 CONTINUE 后返回
+ *                              WAIT 消息通过 instrument_cb(rid, 255, NULL, waiting, len) 通知监听方
+ */
+ret_t instrument_wait(cstr_t waiting, cstr_t from, uint32_t timeout_ms);
+
+/**
+ * @brief                       发送 CONTINUE 应答，中断对端的 instrument_wait
+ * @param to                    目标方名称（WAIT 方的 waiting 参数）
+ * @param from                  本方名称（WAIT 方的 from 参数匹配用）
+ * @return                      E_NONE 成功
+ */
+ret_t instrument_continue(cstr_t to, cstr_t from);
+
+extern uint64_t instrument_waiting;             // 累计 instrument_wait 等待时长（us），P_tick_xxx 自动扣除
+
 #else
-#define instrument_port(...)    ((void)0)
-#define instrument_local(...)   ((void)0)
-#define instrument_remote()     ((void)0)
-#define instrument_slot(...)    ((void)0)
-#define instrument_listen(...)  ((ret_t)((volatile int){E_NONE}))
-#define instrument_enable(...)  ((ret_t)((volatile int){E_NONE}))
-#define instrument_enabled(...) ((volatile bool){false})
+#define instrument_port(...)     ((void)0)
+#define instrument_local(...)    ((void)0)
+#define instrument_remote()      ((void)0)
+#define instrument_slot(...)     ((void)0)
+#define instrument_listen(...)   ((ret_t)((volatile int){E_NONE}))
+#define instrument_enable(...)   ((ret_t)((volatile int){E_NONE}))
+#define instrument_enabled(...)  ((volatile bool){false})
+#define instrument_wait(...)     ((ret_t)((volatile int){E_NONE}))
+#define instrument_continue(...) ((ret_t)((volatile int){E_NONE}))
+#define instrument_waiting       ((volatile uint64_t){0})
 #endif
+
+//-----------------------------------------------------------------------------
 
 static inline void print(const char* fmt, ...) {
 
@@ -1148,10 +1180,11 @@ static inline ret_t P_time_now(P_clock* clock) {
 #define clock_gt(a,b)      ((a).tv_sec>(b).tv_sec || (a).tv_sec==(b).tv_sec && (a).tv_nsec>(b).tv_nsec)
 #define clock_ge(a,b)      ((a).tv_sec>(b).tv_sec || (a).tv_sec==(b).tv_sec && (a).tv_nsec>=(b).tv_nsec)
 
-static uint64_t P_tick_s(void) { P_clock _clk; P_clock_now(&_clk); return clock_s(_clk); }
-static uint64_t P_tick_ms(void) { P_clock _clk; P_clock_now(&_clk); return clock_ms(_clk); }
-static uint64_t P_tick_us(void) { P_clock _clk; P_clock_now(&_clk); return clock_us(_clk); }
+static uint64_t P_tick_s(void)  { P_clock _clk; P_clock_now(&_clk); return clock_s(_clk)  - instrument_waiting / 1000000; }
+static uint64_t P_tick_ms(void) { P_clock _clk; P_clock_now(&_clk); return clock_ms(_clk) - instrument_waiting / 1000; }
+static uint64_t P_tick_us(void) { P_clock _clk; P_clock_now(&_clk); return clock_us(_clk) - instrument_waiting; }
 
+#define tick_diff(now, nlast)  ((now)>(nlast) ? (now)-(nlast) : 0)
 
 // 循环序比较：判断 a 是否比 b 更新
 static bool uint8_circle_newer(uint8_t a, uint8_t b) { uint8_t diff = (uint8_t)(a - b); return diff != 0 && diff < 128; }

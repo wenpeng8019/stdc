@@ -80,6 +80,13 @@ static uint32_t                 g_inst_keep_chn[8] = {0};           // 保留通
 static uint8_t*                 g_inst_bits     = NULL;             // 动态分配
 static uint16_t                 g_inst_bits_len = 0;                // 已分配字节数
 
+// wait/continue 握手状态
+#define INST_WAIT_NAME_MAX      32                                  // 名称最大长度
+static volatile bool            g_inst_wait_done  = false;          // continue 已收到
+static char                     g_inst_wait_from[INST_WAIT_NAME_MAX]; // 期望的 from（空串=任意方）
+
+uint64_t                        instrument_waiting = 0;             // 累计 wait 等待时长（us）
+
 // 前向声明
 static void inst_send_buf(uint8_t chn, char* buf, int tag_len, int text_len);
 
@@ -957,7 +964,7 @@ static void inst_send_bits(uint16_t byte_idx) {
 
     uint8_t pkt[INST_HDR_SIZE + 3];
     nwrite_s(pkt, g_inst_rid);                      // rid
-    nwrite_s(pkt + 2, g_inst_seq++);                // seq
+    nwrite_s(pkt + 2, 0);                           // seq（选项包不占序列号）
     pkt[4] = 1;                                     // type=1 选项包
     pkt[5] = 0;                                     // chn（未使用，占位）
     pkt[6] = 0;                                     // tag_len（未使用，占位）
@@ -1004,6 +1011,124 @@ instrument_enabled(uint16_t idx) {
     return (g_inst_bits[byte_idx] & (1u << (idx % 8))) != 0;
 }
 
+// 发送 type=2 WAIT 包：header(7) + waiting_len(1) + waiting + from_len(1) + from
+// 不占 seq（与选项包相同，接收端不走顺序交付）
+static void inst_send_wait(const char *waiting, const char *from) {
+    if (g_inst_sock == P_INVALID_SOCKET) return;
+
+    uint8_t waiting_len = waiting ? (uint8_t)strlen(waiting) : 0;
+    uint8_t from_len    = from    ? (uint8_t)strlen(from)    : 0;
+    if (waiting_len > INST_WAIT_NAME_MAX) waiting_len = INST_WAIT_NAME_MAX;
+    if (from_len    > INST_WAIT_NAME_MAX) from_len    = INST_WAIT_NAME_MAX;
+
+    uint8_t pkt[INST_HDR_SIZE + 2 + INST_WAIT_NAME_MAX * 2];
+    nwrite_s(pkt, g_inst_rid);                      // rid
+    nwrite_s(pkt + 2, 0);                           // seq（不占序列号）
+    pkt[4] = 2;                                     // type=2 WAIT 包
+    pkt[5] = INSTRUMENT_CTRL;                       // chn（固定）
+    pkt[6] = 0;                                     // tag_len=0
+
+    uint8_t *p = pkt + INST_HDR_SIZE;
+    *p++ = waiting_len;
+    if (waiting_len) { memcpy(p, waiting, waiting_len); p += waiting_len; }
+    *p++ = from_len;
+    if (from_len)    { memcpy(p, from, from_len); p += from_len; }
+
+    sendto(g_inst_sock, (const char*)pkt, (int)(p - pkt), 0,
+           (struct sockaddr*)&g_inst_dest, sizeof(g_inst_dest));
+}
+
+// 发送 type=3 CONTINUE 包：header(7) + to_len(1) + to + by_len(1) + by
+static void inst_send_continue(const char *to, const char *by) {
+    if (g_inst_sock == P_INVALID_SOCKET) return;
+
+    uint8_t to_len = to ? (uint8_t)strlen(to) : 0;
+    uint8_t by_len = by ? (uint8_t)strlen(by) : 0;
+    if (to_len > INST_WAIT_NAME_MAX) to_len = INST_WAIT_NAME_MAX;
+    if (by_len > INST_WAIT_NAME_MAX) by_len = INST_WAIT_NAME_MAX;
+
+    uint8_t pkt[INST_HDR_SIZE + 2 + INST_WAIT_NAME_MAX * 2];
+    nwrite_s(pkt, g_inst_rid);                      // rid
+    nwrite_s(pkt + 2, 0);                           // seq（不占序列号）
+    pkt[4] = 3;                                     // type=3 CONTINUE 包
+    pkt[5] = INSTRUMENT_CTRL;                       // chn（固定）
+    pkt[6] = 0;                                     // tag_len=0
+
+    uint8_t *p = pkt + INST_HDR_SIZE;
+    *p++ = to_len;
+    if (to_len) { memcpy(p, to, to_len); p += to_len; }
+    *p++ = by_len;
+    if (by_len) { memcpy(p, by, by_len); p += by_len; }
+
+    sendto(g_inst_sock, (const char*)pkt, (int)(p - pkt), 0,
+           (struct sockaddr*)&g_inst_dest, sizeof(g_inst_dest));
+}
+
+ret_t instrument_wait(cstr_t waiting, cstr_t from, uint32_t timeout_ms) {
+
+    if (g_inst_sock == P_INVALID_SOCKET && !inst_init_sock())
+        return E_EXTERNAL(P_sock_errno());
+    if (g_inst_thread == 0 && !inst_start_thread())
+        return E_EXTERNAL(P_sock_errno());
+
+    // 设置等待状态
+    g_inst_wait_done = false;
+    if (from && from[0]) {
+        size_t n = strlen(from);
+        if (n >= INST_WAIT_NAME_MAX) n = INST_WAIT_NAME_MAX - 1;
+        memcpy(g_inst_wait_from, from, n);
+        g_inst_wait_from[n] = '\0';
+    } else {
+        g_inst_wait_from[0] = '\0';
+    }
+
+    // 通过 cb 通知本地：chn=INSTRUMENT_CTRL, tag=NULL, text="waiting for <from>"
+    if (g_inst_cb) {
+        char msg[64];
+        int len = snprintf(msg, sizeof(msg), "waiting for %s", from && from[0] ? from : "any");
+        g_inst_cb(g_inst_rid, INSTRUMENT_CTRL, NULL, msg, len);
+    }
+
+    P_clock _clk_start, _clk_now;
+    P_clock_now(&_clk_start);
+    uint64_t resend_interval = 500;                 // 每 500ms 重发一次 WAIT
+
+    for (;;) {
+        inst_send_wait(waiting, from);
+
+        // 等待一个重发间隔或直到收到 continue
+        P_clock _clk_wait;
+        P_clock_now(&_clk_wait);
+        while (!g_inst_wait_done) {
+            P_clock_now(&_clk_now);
+            if ((uint64_t)clock_ms_diff(_clk_now, _clk_wait) >= resend_interval) break;
+            P_usleep(10000);                        // 10ms 轮询
+        }
+
+        if (g_inst_wait_done) {
+            P_clock_now(&_clk_now);
+            instrument_waiting += clock_us_diff(_clk_now, _clk_start);
+            return E_NONE;
+        }
+
+        P_clock_now(&_clk_now);
+        uint64_t elapsed_ms = clock_ms_diff(_clk_now, _clk_start);
+        if (timeout_ms > 0 && elapsed_ms >= timeout_ms) {
+            instrument_waiting += clock_us_diff(_clk_now, _clk_start);
+            return E_TIMEOUT;
+        }
+    }
+}
+
+ret_t instrument_continue(cstr_t to, cstr_t from) {
+
+    if (g_inst_sock == P_INVALID_SOCKET && !inst_init_sock())
+        return E_EXTERNAL(P_sock_errno());
+
+    inst_send_continue(to, from);
+    return E_NONE;
+}
+
 // ---- 发送端 ----
 
 // 内部函数：发送已格式化的文本
@@ -1048,6 +1173,7 @@ inst_send_buf(uint8_t chn, char* buf, int tag_len, int text_len) {
 void
 instrument_slot(uint8_t chn, const char* tag, const char* fmt, va_list params) {
 
+    if (chn == INSTRUMENT_CTRL) return;              // 保留通道，禁止用户使用
     char buf[INST_UDP_MAX];
 
     // 先计算 tag_len，直接格式化到正确位置，避免 memmove
@@ -1229,6 +1355,49 @@ static int32_t inst_thread_proc(void *ctx) {
         // type=1 选项包：直接处理，不走顺序交付
         if (type == 1) {
             inst_handle_bits(buf + INST_HDR_SIZE, n - INST_HDR_SIZE);
+            continue;
+        }
+
+        // type=2 WAIT 包：通过 cb 通知本地（chn=INSTRUMENT_CTRL, tag=NULL）
+        if (type == 2) {
+            uint8_t *p = buf + INST_HDR_SIZE;
+            int remain = n - INST_HDR_SIZE;
+            if (remain < 1) continue;
+            uint8_t waiting_len = *p++; remain--;
+            if (remain < waiting_len) continue;
+            char waiting_name[INST_WAIT_NAME_MAX + 1];
+            if (waiting_len > INST_WAIT_NAME_MAX) waiting_len = INST_WAIT_NAME_MAX;
+            memcpy(waiting_name, p, waiting_len);
+            waiting_name[waiting_len] = '\0';
+            p += waiting_len; remain -= waiting_len;
+            // from_len + from（可选，此处不需要解析）
+            if (g_inst_cb) {
+                g_inst_cb(rid, INSTRUMENT_CTRL, NULL, waiting_name, waiting_len);
+            }
+            continue;
+        }
+
+        // type=3 CONTINUE 包：检查是否是发给自己的
+        if (type == 3) {
+            uint8_t *p = buf + INST_HDR_SIZE;
+            int remain = n - INST_HDR_SIZE;
+            if (remain < 1) continue;
+            uint8_t to_len = *p++; remain--;
+            if (remain < to_len) continue;
+            // 不需要匹配 to（waiting 方自己在等待，收到即可）
+            p += to_len; remain -= to_len;
+            // 解析 by
+            if (remain < 1) continue;
+            uint8_t by_len = *p++; remain--;
+            if (remain < by_len) by_len = (uint8_t)remain;
+            char by_name[INST_WAIT_NAME_MAX + 1];
+            if (by_len > INST_WAIT_NAME_MAX) by_len = INST_WAIT_NAME_MAX;
+            memcpy(by_name, p, by_len);
+            by_name[by_len] = '\0';
+            // 检查 from 过滤
+            if (g_inst_wait_from[0] && strcmp(g_inst_wait_from, by_name) != 0)
+                continue;                           // 不匹配期望的 from，忽略
+            g_inst_wait_done = true;
             continue;
         }
 
