@@ -79,7 +79,7 @@ int main(int argc, char** argv) {
     // 7. 终端测试
     printf("\n7. Terminal Info:\n");
     if (P_isatty(stdout)) {
-        printf("   Terminal size: %d rows x %d cols\n", P_term_rows(), P_term_cols());
+        printf("   Terminal size: %d rows x %d cols\n", P_term_rows(NULL), P_term_cols(NULL));
         printf("   Color test: ");
         printf(P_RED("Red") " ");
         printf(P_GREEN("Green") " ");

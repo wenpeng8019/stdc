@@ -2392,6 +2392,7 @@ static inline ret_t P_join(thd_t hThread, int32_t* r_i32ExitCode/* nullable */) 
 //-----------------------------------------------------------------------------
 // 网络初始化/清理（Windows WSA 特性）
 //-----------------------------------------------------------------------------
+// 注意：inet_pton/inet_ntop 已是标准跨平台 API，无需封装
 
 #if P_WIN
 static inline ret_t P_net_init(void) {
@@ -2566,12 +2567,8 @@ static inline ret_t P_sock_rcvbuf(sock_t s, int size) {
     return ret == 0 ? E_NONE : E_EXTERNAL(P_sock_errno());
 }
 
-//-----------------------------------------------------------------------------
-// 注意：inet_pton/inet_ntop 已是标准跨平台 API，无需封装
-//-----------------------------------------------------------------------------
-
 ///////////////////////////////////////////////////////////////////////////////
-// 终端
+// 终端/控制
 ///////////////////////////////////////////////////////////////////////////////
 
 //-----------------------------------------------------------------------------
@@ -2580,120 +2577,230 @@ static inline ret_t P_sock_rcvbuf(sock_t s, int size) {
 
 #if P_WIN
 #   include <io.h>
+#   include <conio.h>
 #   define P_isatty(f) _isatty(_fileno(f))
 #else
+#   include <sys/ioctl.h>
+#   include <termios.h>
 #   define P_isatty(f) isatty(fileno(f))
 #endif
 
 //-----------------------------------------------------------------------------
-// 终端尺寸：获取终端行数和列数
+// ANSI VT 序列支持
+//
+//  P_TERM_VT: 编译期标志，控制所有 ANSI 转义序列宏是否生成实际内容
+//    POSIX:            始终为 1（所有现代终端均支持）
+//    Windows 10+:      为 1（需先调用 P_term_init() 启用 VT 模式）
+//    Windows 旧版本:    为 0（所有宏回退为空字符串）
+//
+//  可在 #include <stdc.h> 前通过 #define P_TERM_VT 0/1 手动覆盖
+//  （例如：输出重定向到文件、或目标终端不兼容 VT 序列时强制置 0）
 //-----------------------------------------------------------------------------
 
-#if !P_WIN
-#   include <sys/ioctl.h>
+#ifndef P_TERM_VT
+#   define P_TERM_VT 1
 #endif
 
-static inline int P_term_rows(void) {
+#if P_TERM_VT && P_WIN
+#   if !defined(_WIN32_WINNT) || _WIN32_WINNT < 0x0A00
+#       undef P_TERM_VT
+#       define P_TERM_VT 0
+#   endif
+#endif
+
+//-----------------------------------------------------------------------------
+// 终端上下文与尺寸
+//-----------------------------------------------------------------------------
+
+typedef struct {
+#if P_WIN
+    HANDLE  hin;                /* STD_INPUT_HANDLE  */
+    HANDLE  hout;               /* STD_OUTPUT_HANDLE */
+    DWORD   in_mode;            /* 原始输入模式 */
+    DWORD   out_mode;           /* 原始输出模式 */
+#else
+    struct termios  termios;    /* 原始 termios */
+    int             fl;         /* 原始 fcntl 标志 */
+#endif
+    bool            pty;        /* true = ConPTY/管道（Windows），POSIX 始终 false */
+} P_term_ctx_t;
+
+/**
+ * @param ctx  终端上下文；可为 NULL（退回 GetStdHandle / STDOUT_FILENO）
+ */
+static inline int P_term_rows(const P_term_ctx_t *ctx) {
 #if P_WIN
     CONSOLE_SCREEN_BUFFER_INFO csbi;
-    if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi)) {
+    HANDLE h = (ctx && ctx->hout) ? ctx->hout : GetStdHandle(STD_OUTPUT_HANDLE);
+    if (GetConsoleScreenBufferInfo(h, &csbi)) {
         int rows = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
         if (rows > 4) return rows;
     }
 #else
+    (void)ctx;
     struct winsize ws;
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 4)
         return (int)ws.ws_row;
 #endif
-    return 24;  // 默认值
+    return 24;
 }
 
-static inline int P_term_cols(void) {
+static inline int P_term_cols(const P_term_ctx_t *ctx) {
 #if P_WIN
     CONSOLE_SCREEN_BUFFER_INFO csbi;
-    if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi)) {
+    HANDLE h = (ctx && ctx->hout) ? ctx->hout : GetStdHandle(STD_OUTPUT_HANDLE);
+    if (GetConsoleScreenBufferInfo(h, &csbi)) {
         int cols = csbi.srWindow.Right - csbi.srWindow.Left + 1;
         if (cols > 10) return cols;
     }
 #else
+    (void)ctx;
     struct winsize ws;
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 10)
         return (int)ws.ws_col;
 #endif
-    return 80;  // 默认值
+    return 80;
 }
 
-/*
- * ============================================================================
- * 注意：以下终端操作不适合跨平台统一封装（应由应用层按需实现）
- * ============================================================================
- *
- * 1. 终端模式控制（raw 模式 / 行缓冲 / 回显设置）：
- *    【Windows】GetConsoleMode() + SetConsoleMode()
- *               - 使用 DWORD 标志位组合（ENABLE_LINE_INPUT, ENABLE_ECHO_INPUT 等）
- *               - 需区分输入/输出句柄，支持 VT 模式（ENABLE_VIRTUAL_TERMINAL_PROCESSING）
- *    【POSIX】 tcgetattr() + tcsetattr()
- *               - 使用 termios 结构体，包含 c_iflag / c_lflag / c_cc 等多个字段
- *               - 典型 raw 模式设置：t.c_lflag &= ~(ICANON | ECHO)
- *    → 两者语义和 API 完全不同，强行统一会失去灵活性
- *
- * 2. 非阻塞键盘输入检测与读取：
- *    【Windows 真实控制台】_kbhit() + _getch()           （需 <conio.h>）
- *    【Windows ConPTY/管道】PeekNamedPipe() + ReadFile()  （VS Code 等模拟终端）
- *    【POSIX】read(STDIN_FILENO, ...) 配合 fcntl(O_NONBLOCK) + termios raw 模式
- *    → 实现方式差异巨大，依赖终端模式预配置，不适合通用封装
- *
- * 3. 终端专有 API（高度应用相关）：
- *    - POSIX: 窗口大小变化信号 SIGWINCH
- *    - Windows: Console Buffer / Screen Buffer 操作
- *    - 光标控制、滚动区域设置（ANSI 转义序列）
+//-----------------------------------------------------------------------------
+// 终端初始化与恢复
+//
+// P_term_init(ctx)  — 检测 tty、启用 VT 模式(Win)、进入 raw 模式
+//                     ctx 非 NULL 时保存原始状态; ctx->pty 标识 ConPTY 管道
+//                     返回 false 表示非终端（管道/重定向），不做任何改动
+// P_term_final(ctx) — 恢复原始终端设置
+// P_term_input(ctx) — 非阻塞读取一个字符
+//-----------------------------------------------------------------------------
+
+/**
+ * 终端初始化：检测 tty、启用 VT 模式、进入 raw 模式（禁用行缓冲/回显）
+ * @param ctx  保存原始状态，供 P_term_final 恢复；可为 NULL（仅检测 + VT 启用）
+ * @return true  — 成功（stdout 是终端）
+ *         false — 非终端（管道/重定向），不做任何改动
  */
-
-//-----------------------------------------------------------------------------
-// ANSI 转义序列（完整颜色集合）
-// Windows 10+ 支持 VT 模式，可通过 P_FORCE_COLOR 强制开启
-//-----------------------------------------------------------------------------
-
-#if P_WIN && !defined(P_FORCE_COLOR)
-// Windows 旧版本不支持 ANSI，禁用所有颜色输出
-#   define P_COL(c, s)           s
-#   define P_COL_END             ""
-#   define P_COLOR_RESET         ""
-#   define P_BLACK_BEGIN         ""
-#   define P_RED_BEGIN           ""
-#   define P_GREEN_BEGIN         ""
-#   define P_YELLOW_BEGIN        ""
-#   define P_BLUE_BEGIN          ""
-#   define P_PURPLE_BEGIN        ""
-#   define P_CYAN_BEGIN          ""
-#   define P_WHITE_BEGIN         ""
-#   define P_GRAY_BEGIN          ""
-#   define P_HL_RED_BEGIN        ""
-#   define P_HL_GREEN_BEGIN      ""
-#   define P_HL_YELLOW_BEGIN     ""
-#   define P_HL_BLUE_BEGIN       ""
-#   define P_HL_PURPLE_BEGIN     ""
-#   define P_HL_CYAN_BEGIN       ""
-#   define P_HL_WHITE_BEGIN      ""
-#   define P_BLACK(s)            s
-#   define P_RED(s)              s
-#   define P_GREEN(s)            s
-#   define P_YELLOW(s)           s
-#   define P_BLUE(s)             s
-#   define P_PURPLE(s)           s
-#   define P_CYAN(s)             s
-#   define P_WHITE(s)            s
-#   define P_GRAY(s)             s
-#   define P_HL_RED(s)           s
-#   define P_HL_GREEN(s)         s
-#   define P_HL_YELLOW(s)        s
-#   define P_HL_BLUE(s)          s
-#   define P_HL_PURPLE(s)        s
-#   define P_HL_CYAN(s)          s
-#   define P_HL_WHITE(s)         s
-#   define P_HL_BLACK(s)         s
+static inline bool P_term_init(P_term_ctx_t *ctx) {
+    if (!P_isatty(stdout)) return false;
+#if P_WIN
+    HANDLE hout = GetStdHandle(STD_OUTPUT_HANDLE);
+    HANDLE hin  = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD out_mode = 0;
+    GetConsoleMode(hout, &out_mode);
+#if P_TERM_VT
+    SetConsoleMode(hout, out_mode | 0x0004u  /* ENABLE_VIRTUAL_TERMINAL_PROCESSING */
+                                  | 0x0008u); /* DISABLE_NEWLINE_AUTO_RETURN */
+#endif
+    SetConsoleOutputCP(65001);  /* UTF-8 */
+    SetConsoleCP(65001);        /* UTF-8 */
+    if (ctx) {
+        ctx->hout = hout;
+        ctx->hin  = hin;
+        ctx->out_mode = out_mode;
+        ctx->pty = (GetFileType(hin) != FILE_TYPE_CHAR);
+        if (!ctx->pty) {
+            GetConsoleMode(hin, &ctx->in_mode);
+            DWORD new_in = ctx->in_mode & ~(0x0002u /* ENABLE_LINE_INPUT */
+                                           |0x0004u /* ENABLE_ECHO_INPUT */);
+#if P_TERM_VT
+            new_in |= 0x0200u; /* ENABLE_VIRTUAL_TERMINAL_INPUT */
+#endif
+            SetConsoleMode(hin, new_in);
+        }
+    }
 #else
-// 支持 ANSI 转义序列（POSIX 或 Windows 10+ with VT mode）
+    if (ctx) {
+        ctx->pty = false;
+        tcgetattr(STDIN_FILENO, &ctx->termios);
+        ctx->fl = fcntl(STDIN_FILENO, F_GETFL);
+        struct termios t = ctx->termios;
+        t.c_lflag &= ~(unsigned)(ICANON | ECHO);
+        t.c_cc[VMIN]  = 0;
+        t.c_cc[VTIME] = 0;
+        tcsetattr(STDIN_FILENO, TCSANOW, &t);
+        fcntl(STDIN_FILENO, F_SETFL, ctx->fl | O_NONBLOCK);
+    }
+#endif
+    return true;
+}
+
+static inline void P_term_final(const P_term_ctx_t *ctx) {
+    if (!ctx) return;
+#if P_WIN
+    if (!ctx->pty)
+        SetConsoleMode(ctx->hin,  ctx->in_mode);
+    SetConsoleMode(ctx->hout, ctx->out_mode);
+#else
+    tcsetattr(STDIN_FILENO, TCSANOW, &ctx->termios);
+    fcntl(STDIN_FILENO, F_SETFL, ctx->fl);
+#endif
+}
+
+/**
+ * 非阻塞读取一个字符（需先 P_term_init 进入 raw 模式）
+ * @return 0-255 字符值，-1 表示无输入
+ */
+static inline int P_term_input(const P_term_ctx_t *ctx) {
+#if P_WIN
+    if (ctx->pty) {
+        DWORD avail = 0;
+        if (!PeekNamedPipe(ctx->hin, NULL, 0, NULL, &avail, NULL) || avail == 0) return -1;
+        DWORD nr = 0; CHAR raw = 0;
+        if (!ReadFile(ctx->hin, &raw, 1, &nr, NULL) || nr == 0) return -1;
+        return (unsigned char)raw;
+    } else {
+        if (!_kbhit()) return -1;
+        int ch = _getch();
+        if (ch == 0 || ch == 0xE0) { _getch(); return -1; }
+        return ch;
+    }
+#else
+    (void)ctx;
+    unsigned char tmp;
+    if (read(STDIN_FILENO, &tmp, 1) != 1) return -1;
+    return tmp;
+#endif
+}
+
+//--- 光标与屏幕控制 ---
+//  动态参数版本（如 "\033[%d;1H"）仍需应用层自行 printf
+//  以下仅提供常用的固定序列
+
+#if P_TERM_VT
+#   define P_CSI                 "\033["        // 控制序列引导符
+#   define P_CURSOR_SAVE         "\0337"        // 保存光标位置 (DEC)
+#   define P_CURSOR_RESTORE      "\0338"        // 恢复光标位置 (DEC)
+#   define P_CURSOR_HOME         "\033[H"       // 光标移到 (1,1)
+#   define P_CURSOR_TO           "\033[%d;%dH"  // 光标移到 (row, col)  — 2 参数
+#   define P_CURSOR_ROW          "\033[%d;1H"   // 光标移到 (row, 1)   — 1 参数
+#   define P_CLEAR_EOL           "\033[K"       // 清除光标到行尾
+#   define P_CLEAR_LINE          "\033[2K"      // 清除整行
+#   define P_CLEAR_SCREEN        "\033[2J"      // 清除整屏
+#   define P_SCROLL_SET          "\033[%d;%dr"  // 设置滚动区域 (top, bottom) — 2 参数
+#   define P_SCROLL_RESET        "\033[r"       // 重置滚动区域为全屏
+#   define P_BOLD_BEGIN          "\033[1m"      // 加粗
+#   define P_DIM_BEGIN           "\033[2m"      // 变暗
+#   define P_UNDERLINE_BEGIN     "\033[4m"      // 下划线
+#   define P_REVERSE_BEGIN       "\033[7m"      // 反色（前景/背景互换）
+#else
+#   define P_CSI                 ""
+#   define P_CURSOR_SAVE         ""
+#   define P_CURSOR_RESTORE      ""
+#   define P_CURSOR_HOME         ""
+#   define P_CURSOR_TO           "%.0d%.0d"     // 消耗 2 个 int 参数，不输出
+#   define P_CURSOR_ROW          "%.0d"         // 消耗 1 个 int 参数，不输出
+#   define P_CLEAR_EOL           ""
+#   define P_CLEAR_LINE          ""
+#   define P_CLEAR_SCREEN        ""
+#   define P_SCROLL_SET          "%.0d%.0d"     // 消耗 2 个 int 参数，不输出
+#   define P_SCROLL_RESET        ""
+#   define P_BOLD_BEGIN          ""
+#   define P_DIM_BEGIN           ""
+#   define P_UNDERLINE_BEGIN     ""
+#   define P_REVERSE_BEGIN       ""
+#endif
+
+//--- 颜色 ---
+
+#if P_TERM_VT
 #   define P_COL(c, s)           "\033[" #c "m" s "\033[0m"
 #   define P_COL_END             "\033[0m"
 #   define P_COLOR_RESET         "\033[0m"
@@ -2730,6 +2837,43 @@ static inline int P_term_cols(void) {
 #   define P_HL_CYAN(s)          P_COL(96, s)
 #   define P_HL_WHITE(s)         P_COL(97, s)
 #   define P_HL_BLACK(s)         P_COL(90, s)
+#else
+#   define P_COL(c, s)           s
+#   define P_COL_END             ""
+#   define P_COLOR_RESET         ""
+#   define P_BLACK_BEGIN         ""
+#   define P_RED_BEGIN           ""
+#   define P_GREEN_BEGIN         ""
+#   define P_YELLOW_BEGIN        ""
+#   define P_BLUE_BEGIN          ""
+#   define P_PURPLE_BEGIN        ""
+#   define P_CYAN_BEGIN          ""
+#   define P_WHITE_BEGIN         ""
+#   define P_GRAY_BEGIN          ""
+#   define P_HL_RED_BEGIN        ""
+#   define P_HL_GREEN_BEGIN      ""
+#   define P_HL_YELLOW_BEGIN     ""
+#   define P_HL_BLUE_BEGIN       ""
+#   define P_HL_PURPLE_BEGIN     ""
+#   define P_HL_CYAN_BEGIN       ""
+#   define P_HL_WHITE_BEGIN      ""
+#   define P_BLACK(s)            s
+#   define P_RED(s)              s
+#   define P_GREEN(s)            s
+#   define P_YELLOW(s)           s
+#   define P_BLUE(s)             s
+#   define P_PURPLE(s)           s
+#   define P_CYAN(s)             s
+#   define P_WHITE(s)            s
+#   define P_GRAY(s)             s
+#   define P_HL_RED(s)           s
+#   define P_HL_GREEN(s)         s
+#   define P_HL_YELLOW(s)        s
+#   define P_HL_BLUE(s)          s
+#   define P_HL_PURPLE(s)        s
+#   define P_HL_CYAN(s)          s
+#   define P_HL_WHITE(s)         s
+#   define P_HL_BLACK(s)         s
 #endif
 
 ///////////////////////////////////////////////////////////////////////////////
