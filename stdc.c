@@ -85,7 +85,7 @@ static uint16_t                 g_inst_bits_len = 0;                // 已分配
 static volatile bool            g_inst_wait_done  = false;          // continue 已收到
 static char                     g_inst_wait_from[INST_WAIT_NAME_MAX]; // 期望的 from（空串=任意方）
 
-uint64_t                        instrument_waiting = 0;             // 累计 wait 等待时长（us）
+int64_t                         instrument_waiting = 0;             // <=0: 累计等待时长(us)取反; >0: 冻结tick_us
 
 // 前向声明
 static void inst_send_buf(uint8_t chn, char* buf, int tag_len, int text_len);
@@ -1089,9 +1089,16 @@ ret_t instrument_wait(cstr_t waiting, cstr_t from, uint32_t timeout_ms) {
         g_inst_cb(g_inst_rid, INSTRUMENT_CTRL, NULL, msg, len);
     }
 
-    P_clock _clk_start, _clk_now;
+    // 进入 wait：将累计负值转换为冻结正值
+    // instrument_waiting <= 0 时，调整后 tick_us = clock_us + instrument_waiting
+    // 设为正值，即冻结在当前调整时刻
+    P_clock _clk_now; P_clock_now(&_clk_now);
+    instrument_waiting = (int64_t)(clock_us(_clk_now)) + instrument_waiting;
+
+    P_clock _clk_start;
     P_clock_now(&_clk_start);
     uint64_t resend_interval = 500;                 // 每 500ms 重发一次 WAIT
+    ret_t ret = E_TIMEOUT;
 
     for (;;) {
         inst_send_wait(waiting, from);
@@ -1105,19 +1112,18 @@ ret_t instrument_wait(cstr_t waiting, cstr_t from, uint32_t timeout_ms) {
             P_usleep(10000);                        // 10ms 轮询
         }
 
-        if (g_inst_wait_done) {
-            P_clock_now(&_clk_now);
-            instrument_waiting += clock_us_diff(_clk_now, _clk_start);
-            return E_NONE;
-        }
+        if (g_inst_wait_done) { ret = E_NONE; break; }
 
         P_clock_now(&_clk_now);
         uint64_t elapsed_ms = clock_ms_diff(_clk_now, _clk_start);
-        if (timeout_ms > 0 && elapsed_ms >= timeout_ms) {
-            instrument_waiting += clock_us_diff(_clk_now, _clk_start);
-            return E_TIMEOUT;
-        }
+        if (timeout_ms > 0 && elapsed_ms >= timeout_ms) break;
     }
+
+    // 退出 wait：将冻结正值恢复为累计负值
+    // frozen_tick_us - current_clock_us = 负值（累计增大）
+    P_clock_now(&_clk_now);
+    instrument_waiting = instrument_waiting - (int64_t)(clock_us(_clk_now));
+    return ret;
 }
 
 ret_t instrument_continue(cstr_t to, cstr_t from) {

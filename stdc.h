@@ -378,7 +378,7 @@ ret_t instrument_wait(cstr_t waiting, cstr_t from, uint32_t timeout_ms);
  */
 ret_t instrument_continue(cstr_t to, cstr_t from);
 
-extern uint64_t instrument_waiting;             // 累计 instrument_wait 等待时长（us），P_tick_xxx 自动扣除
+extern int64_t instrument_waiting;               // <=0: 累计等待时长(us)取反; >0: wait中冻结的tick_us
 
 #else
 #define instrument_port(...)     ((void)0)
@@ -390,7 +390,7 @@ extern uint64_t instrument_waiting;             // 累计 instrument_wait 等待
 #define instrument_enabled(...)  ((volatile bool){false})
 #define instrument_wait(...)     ((ret_t)((volatile int){E_NONE}))
 #define instrument_continue(...) ((ret_t)((volatile int){E_NONE}))
-#define instrument_waiting       ((volatile uint64_t){0})
+#define instrument_waiting       ((volatile int64_t){0})
 #endif
 
 //-----------------------------------------------------------------------------
@@ -1180,9 +1180,9 @@ static inline ret_t P_time_now(P_clock* clock) {
 #define clock_gt(a,b)      ((a).tv_sec>(b).tv_sec || (a).tv_sec==(b).tv_sec && (a).tv_nsec>(b).tv_nsec)
 #define clock_ge(a,b)      ((a).tv_sec>(b).tv_sec || (a).tv_sec==(b).tv_sec && (a).tv_nsec>=(b).tv_nsec)
 
-static uint64_t P_tick_s(void)  { P_clock _clk; P_clock_now(&_clk); return clock_s(_clk)  - instrument_waiting / 1000000; }
-static uint64_t P_tick_ms(void) { P_clock _clk; P_clock_now(&_clk); return clock_ms(_clk) - instrument_waiting / 1000; }
-static uint64_t P_tick_us(void) { P_clock _clk; P_clock_now(&_clk); return clock_us(_clk) - instrument_waiting; }
+static uint64_t P_tick_s(void)  { if (instrument_waiting > 0) return (uint64_t)instrument_waiting / 1000000; P_clock _clk; P_clock_now(&_clk); return clock_s(_clk)  + (uint64_t)(instrument_waiting / 1000000); }
+static uint64_t P_tick_ms(void) { if (instrument_waiting > 0) return (uint64_t)instrument_waiting / 1000;    P_clock _clk; P_clock_now(&_clk); return clock_ms(_clk) + (uint64_t)(instrument_waiting / 1000); }
+static uint64_t P_tick_us(void) { if (instrument_waiting > 0) return (uint64_t)instrument_waiting;           P_clock _clk; P_clock_now(&_clk); return clock_us(_clk) + (uint64_t)instrument_waiting; }
 
 #define tick_diff(now, nlast)  ((now)>(nlast) ? (now)-(nlast) : 0)
 
