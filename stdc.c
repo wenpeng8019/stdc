@@ -760,7 +760,7 @@ void log_slot(log_level_e level, const char *tag, const char *fmt, va_list param
     }
     #endif
 
-    int total = (out == buf) ? n : tag_len + 1 + n;  // 总输出长度
+    int total = (out == buf) ? n : tag_len + 1 + n;  // 总输出长度 todo 确保 total 可以 + 1，即补充一个 \n
 
     // 对于标准输出
     if (cb_log == (log_cb)-1) {

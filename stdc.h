@@ -2,6 +2,7 @@
 #define STDC_H_
 
 #pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunknown-pragmas"
 #pragma clang diagnostic ignored "-Wunused-function"
 #pragma ide diagnostic ignored "OCUnusedMacroInspection"
 #pragma ide diagnostic ignored "OCUnusedGlobalDeclarationInspection"
@@ -228,6 +229,7 @@ typedef enum {
     LOG_SLOT_VERBOSE,                               /* 任何信息（常用于输出说明文档） */
 } log_level_e;
 
+// 这里的 txt 是可以写入变更的，但需要确保编辑的区域 <= len+1，例如增加一个 \n，或移除末尾的 \n（如果存在）
 typedef void(*log_cb)(log_level_e level, const char* tag, char *txt, int len);
 
 /**
@@ -474,10 +476,11 @@ static inline void print(const char* fmt, ...) {
     }
 
     if (s_begin) log_slot(LOG_SLOT_NONE, NULL, fmt, args, (log_cb)LOG_CALLBACK, LOG_TAG_P);
-    else { instrument_slot(chn, tag, fmt, args);
-        if (chn <= LOG_LEVEL)
-            log_slot(chn, tag, fmt, args, (log_cb)LOG_CALLBACK, LOG_TAG_P);
-    }
+    else if (chn <= LOG_LEVEL)
+        log_slot(chn, tag, fmt, args, (log_cb)LOG_CALLBACK, LOG_TAG_P);
+#ifdef LOG_INSTRUMENT
+    else instrument_slot(chn, tag, fmt, args);
+#endif
 
     va_end (args);
 }
@@ -2880,5 +2883,6 @@ static inline int P_term_input(const P_term_ctx_t *ctx) {
 #ifdef __cplusplus
 }
 #endif
+#pragma ide diagnostic pop
 #pragma clang diagnostic pop
 #endif  // STDC_H_
