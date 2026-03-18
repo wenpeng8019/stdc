@@ -5,6 +5,10 @@
 
 #include "stdc.h"
 
+#ifdef printf
+#undef printf
+#endif
+
 lang_cb                         P_lang;
 
 static char                     g_log_name[64];                     // 系统日志名称（从可执行文件名提取）
@@ -14,9 +18,47 @@ static void*                    g_cache_head, *g_cache_rear;
 static uint32_t                 g_line_count;
 static P_mutex_t                g_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-
-
+//-----------------------------------------------------------------------------
 #ifdef LOG_INSTRUMENT
+
+// 联通模式
+typedef enum {
+    INST_MODE_LOCAL  = 0,   // 只本地回调，不网络
+    INST_MODE_HOST   = 1,   // 本地回调 + 127.0.0.1（默认，同一主机可见）
+    INST_MODE_REMOTE = 2,   // 本地回调 + 局域网广播
+} inst_mode_e;
+static inst_mode_e              g_inst_mode   = INST_MODE_HOST;     // 默认主机模式
+static uint32_t                 g_inst_keep_chn[8] = {0};           // 保留通道 bitset (256位)，作为本地模式的过滤选项
+                                                                    // + 即只对特定通道进行数据广播
+static uint16_t                 g_inst_port   = INSTRUMENT_PORT;    // 可通过 instrument_port() 修改
+static uint8_t                  g_inst_ctrl   = INSTRUMENT_CTRL;    // 可通过 instrument_ctrl() 修改
+
+// 本地回调和监听
+static instrument_cb            g_inst_cb     = NULL;
+static TLS int                  g_inst_in_cb  = 0;                  // 防止回调递归
+
+// 本地选项 bitset
+static uint8_t*                 g_inst_bits     = NULL;             // 动态分配
+static uint16_t                 g_inst_bits_len = 0;                // 已分配字节数
+
+// instrument tick 机制，用于 P_tick_xxx() 相关操作
+int64_t                         instrument_waiting = 0;             // <=0: 累计等待时长(us)取反; >0: 冻结tick_us
+
+// 本地端口和通讯
+static uint16_t                 g_inst_rid    = 0;                  // 本节点随机 ID
+static uint16_t                 g_inst_seq    = 0;
+static sock_t                   g_inst_sock   = P_INVALID_SOCKET;
+static struct sockaddr_in       g_inst_dest;
+
+// 运行和状态
+static volatile bool            g_inst_running = false;
+static thd_t                    g_inst_thread  = 0;
+
+// 组播地址：239.255.77.77 (自定义本地管理组播地址)
+// - 239.0.0.0/8 为本地管理组播范围 (RFC 2365)
+// - 使用组播而非单播的原因：SO_REUSEPORT 对单播是负载均衡（只有一个进程收到），
+//   而组播可确保本机所有监听进程都能收到消息
+#define INST_MCAST_ADDR         0xEFFF4D4D                          // 239.255.77.77
 
 // 典型以太网 MTU=1500，减去 IP(20) + UDP(8) 头部，保守取 1400
 #define INST_UDP_MAX            1400
@@ -25,67 +67,26 @@ static P_mutex_t                g_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 #define INST_WINDOW_SIZE        64                                  // 接收端滑动窗口大小（必须为 2 的幂）
 #define INST_WINDOW_MASK        (INST_WINDOW_SIZE - 1)
 
-// 组播地址：239.255.77.77 (自定义本地管理组播地址)
-// - 239.0.0.0/8 为本地管理组播范围 (RFC 2365)
-// - 使用组播而非单播的原因：SO_REUSEPORT 对单播是负载均衡（只有一个进程收到），
-//   而组播可确保本机所有监听进程都能收到消息
-#define INST_MCAST_ADDR         0xEFFF4D4D                          // 239.255.77.77
-
-// 运行和状态
-static volatile bool            g_inst_running = false;
-static thd_t                    g_inst_thread  = 0;
-
-// 单 socket 用于收发（bind 到 INSTRUMENT_PORT）
-// 首次调用时自动初始化，进程退出时自动关闭
-static uint16_t                 g_inst_rid    = 0;                  // 本节点随机 ID
-static sock_t                   g_inst_sock   = P_INVALID_SOCKET;
-static struct sockaddr_in       g_inst_dest;
-static uint16_t                 g_inst_port   = INSTRUMENT_PORT;    // 可通过 instrument_port() 修改
-static uint16_t                 g_inst_seq    = 0;
-
-// 接收线程相关
+// 窗口槽位
 typedef struct {
     uint8_t data[INST_UDP_MAX + 1];                  // +1 供交付时追加 '\0'
     int len;                                         // 0 = 空槽
-    uint16_t rid;                                    // 发送方 rid
 } inst_slot_t;
 
-// Per-RID 序号追踪（支持多发送方）
-#define INST_MAX_SENDERS        8
-typedef struct {
-    uint16_t rid;
-    uint16_t next_seq;
-    bool synced;
+// RID (sender) 分组，每个 sender 独立滑动窗口（单向链表，动态分配）
+typedef struct inst_sender_s {
+    struct inst_sender_s*   next;
+    uint16_t                rid;
+    uint16_t                next_seq;
+    bool                    synced;
+    inst_slot_t             win[INST_WINDOW_SIZE];
 } inst_sender_t;
-static inst_sender_t            g_inst_senders[INST_MAX_SENDERS];
-static int                      g_inst_sender_cnt = 0;
-
-static instrument_cb            g_inst_cb     = NULL;
-static uint16_t                 g_inst_options_base = 0;
-static TLS int                  g_inst_in_cb  = 0;                  // 防止回调递归
-static inst_slot_t              g_inst_win[INST_WINDOW_SIZE];
-static uint16_t                 g_inst_next   = 0;                  // 下一个期望 seq（全局，用于窗口索引）
-static bool                     g_inst_synced = false;              // 首包同步标记（已废弃，保留兼容）
-
-// 广播模式
-typedef enum {
-    INST_MODE_LOCAL  = 0,   // 只本地回调，不网络
-    INST_MODE_HOST   = 1,   // 本地回调 + 127.0.0.1（默认，同一主机可见）
-    INST_MODE_REMOTE = 2,   // 本地回调 + 局域网广播
-} inst_mode_e;
-static inst_mode_e              g_inst_mode   = INST_MODE_HOST;     // 默认主机模式
-static uint32_t                 g_inst_keep_chn[8] = {0};           // 保留通道 bitset (256位)
-
-// 选项 bitset
-static uint8_t*                 g_inst_bits     = NULL;             // 动态分配
-static uint16_t                 g_inst_bits_len = 0;                // 已分配字节数
+static inst_sender_t           *g_inst_senders = NULL;
 
 // wait/continue 握手状态
-#define INST_WAIT_NAME_MAX      32                                  // 名称最大长度
+#define INST_WAIT_PORT_MAX      32                                  // 等待端口最大长度
+static char                     g_inst_wait_from[INST_WAIT_PORT_MAX]; // 期望的 from（空串=任意方）
 static volatile bool            g_inst_wait_done  = false;          // continue 已收到
-static char                     g_inst_wait_from[INST_WAIT_NAME_MAX]; // 期望的 from（空串=任意方）
-
-int64_t                         instrument_waiting = 0;             // <=0: 累计等待时长(us)取反; >0: 冻结tick_us
 
 // 前向声明
 static void inst_send_buf(uint8_t chn, char* buf, int tag_len, int text_len);
@@ -95,10 +96,7 @@ static void inst_send_buf(uint8_t chn, char* buf, int tag_len, int text_len);
 #else
 #define LOG_HDR_RESERVE         0
 #endif
-
-#ifdef printf
-#undef printf
-#endif
+//-----------------------------------------------------------------------------
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -851,6 +849,95 @@ void log_slot(log_level_e level, const char *tag, const char *fmt, va_list param
 ///////////////////////////////////////////////////////////////////////////////
 #ifdef LOG_INSTRUMENT
 
+void
+instrument_port(uint16_t port) {
+    
+    assert(g_inst_sock == P_INVALID_SOCKET);        // 必须在首次使用前调用
+    g_inst_port = port;
+}
+
+void
+instrument_ctrl(uint16_t chn) {
+    
+    assert(g_inst_sock == P_INVALID_SOCKET);        // 必须在首次使用前调用
+    g_inst_ctrl = (uint8_t)chn;
+}
+
+void
+instrument_local(int keep_chn, ...) {
+
+    g_inst_mode = INST_MODE_LOCAL;
+    
+    // 清空保留列表
+    memset(g_inst_keep_chn, 0, sizeof(g_inst_keep_chn));
+    
+    // 如果第一个参数为 0，表示关闭全部
+    if (keep_chn == 0) return;
+    
+    // 设置保留通道
+    g_inst_keep_chn[keep_chn / 32] |= (1u << (keep_chn % 32));
+    
+    va_list args;
+    va_start(args, keep_chn);
+    uint8_t chn;
+    while ((chn = (uint8_t)va_arg(args, int)) != 0) {
+        g_inst_keep_chn[chn / 32] |= (1u << (chn % 32));
+    }
+    va_end(args);
+}
+
+void
+instrument_remote(void) {
+
+    g_inst_mode = INST_MODE_REMOTE;
+    
+    // 如果 socket 已初始化，更新目标地址
+    if (g_inst_sock != P_INVALID_SOCKET) {
+        g_inst_dest.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+    }
+}
+
+void
+instrument_slot(uint8_t chn, const char* tag, const char* fmt, va_list params) {
+
+    if (chn == g_inst_ctrl) return;                   // 保留通道，禁止用户使用
+    char buf[INST_UDP_MAX];
+
+    // 先计算 tag_len，直接格式化到正确位置，避免 memmove
+    int tag_len = tag ? (int)strlen(tag) : 0;
+    if (tag_len > 255) tag_len = 255;
+
+    char* tag_pos  = buf + INST_HDR_SIZE;
+    char* text_pos = tag_pos + tag_len + 1;         // 跳过 tag + \0
+    int text_max   = INST_PAYLOAD_MAX - tag_len - 1; // 最小 1393-255-1=1137
+    int text_len;
+
+    // "% " 前缀：直接拷贝字符串
+    if (*fmt == '%' && fmt[1] == ' ') { const char *src = fmt + 2;
+        text_len = (int)strlen(src);
+        if (text_len > text_max) text_len = text_max;
+        memcpy(text_pos, src, text_len);
+    }
+    // 格式化到 text 位置
+    else {
+        text_len = vsnprintf(text_pos, text_max, fmt, params);
+        if (text_len < 0) text_len = 0;
+        if (text_len >= text_max) text_len = text_max - 1;
+    }
+
+    // 写入 tag + \0
+    if (tag_len > 0) memcpy(tag_pos, tag, tag_len);
+    tag_pos[tag_len] = '\0';
+
+    inst_send_buf(chn, buf, tag_len, text_len);
+}
+
+
+static void inst_free_senders(void) {
+    inst_sender_t *s;
+    while ((s = g_inst_senders)) { g_inst_senders = s->next; free(s); }
+}
+
 static void inst_cleanup(void) {
     g_inst_running = false;
     if (g_inst_thread) {
@@ -866,17 +953,26 @@ static void inst_cleanup(void) {
         g_inst_bits = NULL;
         g_inst_bits_len = 0;
     }
+    inst_free_senders();
 }
 
-void
-instrument_port(uint16_t port) {
-    assert(g_inst_sock == P_INVALID_SOCKET);        // 必须在首次使用前调用
-    g_inst_port = port;
+// 确保 bitset 能容纳指定字节偏移
+static void inst_bits_reserve(uint16_t byte_idx) {
+    uint16_t need = byte_idx + 1;
+    if (need <= g_inst_bits_len) return;
+
+    uint8_t *new_bits = (uint8_t*)realloc(g_inst_bits, need);
+    if (!new_bits) return;
+
+    // 新增部分初始化为 0
+    memset(new_bits + g_inst_bits_len, 0, need - g_inst_bits_len);
+    g_inst_bits = new_bits;
+    g_inst_bits_len = need;
 }
 
 // 初始化 socket（仅网络，不启动线程）
 // 前置条件：g_inst_sock == P_INVALID_SOCKET（调用处判断）
-// 纯发送场景（instrument_enable/instrument_slot）只需调用此函数
+// 纯发送场景（instrument_set/instrument_slot）只需调用此函数
 static bool inst_init_sock(void) {
 
     assert(g_inst_sock == P_INVALID_SOCKET);
@@ -939,7 +1035,7 @@ static int32_t inst_thread_proc(void *ctx);  // 前向声明
 
 // 启动接收线程（监听场景需要）
 // 前置条件：g_inst_sock 已初始化，g_inst_thread == 0（调用处判断）
-// instrument_listen/instrument_enabled 需要调用此函数以接收其他进程的消息
+// instrument_listen/instrument_get 需要调用此函数以接收其他进程的消息
 static bool inst_start_thread(void) {
 
     assert(g_inst_sock != P_INVALID_SOCKET);
@@ -953,21 +1049,7 @@ static bool inst_start_thread(void) {
     return true;
 }
 
-// ---- 选项 bitset ----
-
-// 确保 bitset 能容纳指定字节偏移
-static void inst_bits_reserve(uint16_t byte_idx) {
-    uint16_t need = byte_idx + 1;
-    if (need <= g_inst_bits_len) return;
-
-    uint8_t *new_bits = (uint8_t*)realloc(g_inst_bits, need);
-    if (!new_bits) return;
-
-    // 新增部分初始化为 0
-    memset(new_bits + g_inst_bits_len, 0, need - g_inst_bits_len);
-    g_inst_bits = new_bits;
-    g_inst_bits_len = need;
-}
+// ---- 选项机制 ----
 
 // 发送 type=1 包：header(7) + offset(2) + byte(1)
 // 包格式与 type=0 统一使用 INST_HDR_SIZE header，便于接收端统一处理
@@ -990,13 +1072,12 @@ static void inst_send_bits(uint16_t byte_idx) {
 }
 
 ret_t
-instrument_enable(uint16_t idx, bool enable) {
+instrument_set(uint16_t idx, bool enable) {
 
     // 发送操作：只需初始化 socket，不启动接收线程
     if (g_inst_sock == P_INVALID_SOCKET && !inst_init_sock())
         return E_EXTERNAL(P_sock_errno());
 
-    idx += g_inst_options_base;
     uint16_t byte_idx = idx / 8; uint8_t  bit_mask = (uint8_t)(1u << (idx % 8));
 
     inst_bits_reserve(byte_idx);
@@ -1012,17 +1093,74 @@ instrument_enable(uint16_t idx, bool enable) {
 }
 
 bool
-instrument_enabled(uint16_t idx) {
+instrument_get(uint16_t idx) {
 
     // 监听操作：需要启动接收线程以接收其他进程的选项包
     if (g_inst_sock == P_INVALID_SOCKET && !inst_init_sock()) return false;
     if (g_inst_thread == 0 && !inst_start_thread()) return false;
 
-    idx += g_inst_options_base;
     uint16_t byte_idx = idx / 8;
     if (byte_idx >= g_inst_bits_len) return false;
     return (g_inst_bits[byte_idx] & (1u << (idx % 8))) != 0;
 }
+
+// ---- 消息机制 ----
+
+// 内部函数：发送已格式化的文本
+// buf: 缓冲区，tag + \0 + text 从 buf + INST_HDR_SIZE 开始
+// tag_len: tag 长度（tag 已在 buf + INST_HDR_SIZE，后跟 \0）
+// text_len: text 长度（text 从 tag + tag_len + 1 开始）
+static void
+inst_send_buf(uint8_t chn, char* buf, int tag_len, int text_len) {
+
+    char* tag  = buf + INST_HDR_SIZE;
+    char* text = tag + tag_len + 1;                 // 跳过 \0
+
+    // 本地回调：tag 已有 \0 结尾，直接使用
+    // 递归保护：防止回调中调用 print() 导致无限递归
+    if (g_inst_cb && !g_inst_in_cb) {
+        g_inst_in_cb = 1;
+        g_inst_cb(0, chn, tag, text, text_len);
+        g_inst_in_cb = 0;
+    }
+
+    // 本地模式：只发送保留通道
+    if (g_inst_mode == INST_MODE_LOCAL) {
+        if (!(g_inst_keep_chn[chn / 32] & (1u << (chn % 32)))) return;
+    }
+    
+    // 发送操作：只需初始化 socket，不启动接收线程
+    if (g_inst_sock == P_INVALID_SOCKET && !inst_init_sock()) return;
+
+    // 写入固定 header (7 bytes)
+    uint8_t *pkt = (uint8_t*)buf;
+    nwrite_s(pkt, g_inst_rid);                      // rid
+    nwrite_s(pkt + 2, g_inst_seq++);                // seq
+    pkt[4] = 0;                                     // type=0 数据包
+    pkt[5] = chn;                                   // chn
+    pkt[6] = (uint8_t)tag_len;                      // tag_len
+
+    // 协议: header + tag + \0 + text
+    sendto(g_inst_sock, buf, INST_HDR_SIZE + tag_len + 1 + text_len, 0,
+           (struct sockaddr*)&g_inst_dest, sizeof(g_inst_dest));
+}
+
+ret_t
+instrument_listen(instrument_cb cb) {
+
+    // 监听操作：需要启动接收线程
+    if (g_inst_sock == P_INVALID_SOCKET && !inst_init_sock())
+        return E_EXTERNAL(P_sock_errno());
+    if (g_inst_thread == 0 && !inst_start_thread())
+        return E_EXTERNAL(P_sock_errno());
+
+    inst_free_senders();
+    g_inst_cb     = cb;
+
+    return E_NONE;
+}
+
+// ---- 同步等待机制 ----
 
 // 发送 type=2 WAIT 包：header(7) + waiting_len(1) + waiting + from_len(1) + from
 // 不占 seq（与选项包相同，接收端不走顺序交付）
@@ -1031,14 +1169,14 @@ static void inst_send_wait(const char *port, const char *from) {
 
     uint8_t port_len = port ? (uint8_t)strlen(port) : 0;
     uint8_t from_len = from ? (uint8_t)strlen(from) : 0;
-    if (port_len > INST_WAIT_NAME_MAX) port_len = INST_WAIT_NAME_MAX;
-    if (from_len    > INST_WAIT_NAME_MAX) from_len    = INST_WAIT_NAME_MAX;
+    if (port_len > INST_WAIT_PORT_MAX) port_len = INST_WAIT_PORT_MAX;
+    if (from_len    > INST_WAIT_PORT_MAX) from_len    = INST_WAIT_PORT_MAX;
 
-    uint8_t pkt[INST_HDR_SIZE + 2 + INST_WAIT_NAME_MAX * 2];
+    uint8_t pkt[INST_HDR_SIZE + 2 + INST_WAIT_PORT_MAX * 2];
     nwrite_s(pkt, g_inst_rid);                      // rid
     nwrite_s(pkt + 2, 0);                           // seq（不占序列号）
     pkt[4] = 2;                                     // type=2 WAIT 包
-    pkt[5] = INSTRUMENT_CTRL;                       // chn（固定）
+    pkt[5] = g_inst_ctrl;                            // chn（固定）
     pkt[6] = 0;                                     // tag_len=0
 
     uint8_t *p = pkt + INST_HDR_SIZE;
@@ -1057,14 +1195,14 @@ static void inst_send_continue(const char *to, const char *by) {
 
     uint8_t to_len = to ? (uint8_t)strlen(to) : 0;
     uint8_t by_len = by ? (uint8_t)strlen(by) : 0;
-    if (to_len > INST_WAIT_NAME_MAX) to_len = INST_WAIT_NAME_MAX;
-    if (by_len > INST_WAIT_NAME_MAX) by_len = INST_WAIT_NAME_MAX;
+    if (to_len > INST_WAIT_PORT_MAX) to_len = INST_WAIT_PORT_MAX;
+    if (by_len > INST_WAIT_PORT_MAX) by_len = INST_WAIT_PORT_MAX;
 
-    uint8_t pkt[INST_HDR_SIZE + 2 + INST_WAIT_NAME_MAX * 2];
+    uint8_t pkt[INST_HDR_SIZE + 2 + INST_WAIT_PORT_MAX * 2];
     nwrite_s(pkt, g_inst_rid);                      // rid
     nwrite_s(pkt + 2, 0);                           // seq（不占序列号）
     pkt[4] = 3;                                     // type=3 CONTINUE 包
-    pkt[5] = INSTRUMENT_CTRL;                       // chn（固定）
+    pkt[5] = g_inst_ctrl;                            // chn（固定）
     pkt[6] = 0;                                     // tag_len=0
 
     uint8_t *p = pkt + INST_HDR_SIZE;
@@ -1088,7 +1226,7 @@ ret_t instrument_wait(cstr_t port, cstr_t from, uint32_t timeout_ms) {
     g_inst_wait_done = false;
     if (from && from[0]) {
         size_t n = strlen(from);
-        if (n >= INST_WAIT_NAME_MAX) n = INST_WAIT_NAME_MAX - 1;
+        if (n >= INST_WAIT_PORT_MAX) n = INST_WAIT_PORT_MAX - 1;
         memcpy(g_inst_wait_from, from, n);
         g_inst_wait_from[n] = '\0';
     } else {
@@ -1099,7 +1237,7 @@ ret_t instrument_wait(cstr_t port, cstr_t from, uint32_t timeout_ms) {
     if (g_inst_cb) {
         char msg[64];
         int len = snprintf(msg, sizeof(msg), "waiting for %s", from && from[0] ? from : "any");
-        g_inst_cb(g_inst_rid, INSTRUMENT_CTRL, NULL, msg, len);
+        g_inst_cb(g_inst_rid, g_inst_ctrl, NULL, msg, len);
     }
 
     // 进入 wait：将累计负值转换为冻结正值
@@ -1148,133 +1286,23 @@ ret_t instrument_continue(cstr_t to, cstr_t from) {
     return E_NONE;
 }
 
-// ---- 发送端 ----
+// ---- 线程监听处理过程 ----
 
-// 内部函数：发送已格式化的文本
-// buf: 缓冲区，tag + \0 + text 从 buf + INST_HDR_SIZE 开始
-// tag_len: tag 长度（tag 已在 buf + INST_HDR_SIZE，后跟 \0）
-// text_len: text 长度（text 从 tag + tag_len + 1 开始）
-static void
-inst_send_buf(uint8_t chn, char* buf, int tag_len, int text_len) {
+// 查找或创建 sender 条目（单向链表，动态分配）
+static inst_sender_t* inst_find_sender(uint16_t rid) {
 
-    char* tag  = buf + INST_HDR_SIZE;
-    char* text = tag + tag_len + 1;                 // 跳过 \0
-
-    // 本地回调：tag 已有 \0 结尾，直接使用
-    // 递归保护：防止回调中调用 print() 导致无限递归
-    if (g_inst_cb && !g_inst_in_cb) {
-        g_inst_in_cb = 1;
-        g_inst_cb(0, chn, tag, text, text_len);
-        g_inst_in_cb = 0;
+    for (inst_sender_t *s = g_inst_senders; s; s = s->next) {
+        if (s->rid == rid) return s;
     }
 
-    // 本地模式：只发送保留通道
-    if (g_inst_mode == INST_MODE_LOCAL) {
-        if (!(g_inst_keep_chn[chn / 32] & (1u << (chn % 32)))) return;
-    }
-    
-    // 发送操作：只需初始化 socket，不启动接收线程
-    if (g_inst_sock == P_INVALID_SOCKET && !inst_init_sock()) return;
-
-    // 写入固定 header (7 bytes)
-    uint8_t *pkt = (uint8_t*)buf;
-    nwrite_s(pkt, g_inst_rid);                      // rid
-    nwrite_s(pkt + 2, g_inst_seq++);                // seq
-    pkt[4] = 0;                                     // type=0 数据包
-    pkt[5] = chn;                                   // chn
-    pkt[6] = (uint8_t)tag_len;                      // tag_len
-
-    // 协议: header + tag + \0 + text
-    sendto(g_inst_sock, buf, INST_HDR_SIZE + tag_len + 1 + text_len, 0,
-           (struct sockaddr*)&g_inst_dest, sizeof(g_inst_dest));
+    // 创建新条目（calloc 自动清零 win/next_seq/synced）
+    inst_sender_t *s = (inst_sender_t*)calloc(1, sizeof(inst_sender_t));
+    if (!s) return NULL;
+    s->rid  = rid;
+    s->next = g_inst_senders;
+    g_inst_senders = s;
+    return s;
 }
-
-void
-instrument_slot(uint8_t chn, const char* tag, const char* fmt, va_list params) {
-
-    if (chn == INSTRUMENT_CTRL) return;              // 保留通道，禁止用户使用
-    char buf[INST_UDP_MAX];
-
-    // 先计算 tag_len，直接格式化到正确位置，避免 memmove
-    int tag_len = tag ? (int)strlen(tag) : 0;
-    if (tag_len > 255) tag_len = 255;
-
-    char* tag_pos  = buf + INST_HDR_SIZE;
-    char* text_pos = tag_pos + tag_len + 1;         // 跳过 tag + \0
-    int text_max   = INST_PAYLOAD_MAX - tag_len - 1; // 最小 1393-255-1=1137
-    int text_len;
-
-    // "% " 前缀：直接拷贝字符串
-    if (*fmt == '%' && fmt[1] == ' ') { const char *src = fmt + 2;
-        text_len = (int)strlen(src);
-        if (text_len > text_max) text_len = text_max;
-        memcpy(text_pos, src, text_len);
-    }
-    // 格式化到 text 位置
-    else {
-        text_len = vsnprintf(text_pos, text_max, fmt, params);
-        if (text_len < 0) text_len = 0;
-        if (text_len >= text_max) text_len = text_max - 1;
-    }
-
-    // 写入 tag + \0
-    if (tag_len > 0) memcpy(tag_pos, tag, tag_len);
-    tag_pos[tag_len] = '\0';
-
-    inst_send_buf(chn, buf, tag_len, text_len);
-}
-
-// ---- 监听端 ----
-
-ret_t
-instrument_listen(instrument_cb cb, uint16_t options_base) {
-
-    // 监听操作：需要启动接收线程
-    if (g_inst_sock == P_INVALID_SOCKET && !inst_init_sock())
-        return E_EXTERNAL(P_sock_errno());
-    if (g_inst_thread == 0 && !inst_start_thread())
-        return E_EXTERNAL(P_sock_errno());
-
-    g_inst_cb     = cb;
-    memset(g_inst_win, 0, sizeof(g_inst_win));
-    g_inst_synced = false;
-    g_inst_options_base = options_base;
-
-    return E_NONE;
-}
-
-void
-instrument_local(int keep_chn, ...) {
-    g_inst_mode = INST_MODE_LOCAL;
-    
-    // 清空保留列表
-    memset(g_inst_keep_chn, 0, sizeof(g_inst_keep_chn));
-    
-    // 如果第一个参数为 0，表示关闭全部
-    if (keep_chn == 0) return;
-    
-    // 设置保留通道
-    g_inst_keep_chn[keep_chn / 32] |= (1u << (keep_chn % 32));
-    
-    va_list args;
-    va_start(args, keep_chn);
-    uint8_t chn;
-    while ((chn = (uint8_t)va_arg(args, int)) != 0) {
-        g_inst_keep_chn[chn / 32] |= (1u << (chn % 32));
-    }
-    va_end(args);
-}
-
-void
-instrument_remote(void) {
-    g_inst_mode = INST_MODE_REMOTE;
-    // 如果 socket 已初始化，更新目标地址
-    if (g_inst_sock != P_INVALID_SOCKET) {
-        g_inst_dest.sin_addr.s_addr = htonl(INADDR_BROADCAST);
-    }
-}
-
-// ---- 监听端 ----
 
 // 处理 type=1 选项包
 static void inst_handle_bits(uint8_t *payload, int len) {
@@ -1314,48 +1342,6 @@ static void inst_deliver(uint16_t rid, uint8_t *pkt, int len) {
     g_inst_cb(rid, chn, tag, text, text_len);
 }
 
-// 从 g_inst_next 开始连续交付已缓冲的包
-static int inst_flush(void) {
-    int count = 0;
-    for (;;) {
-        int idx = g_inst_next & INST_WINDOW_MASK;
-        if (g_inst_win[idx].len == 0) break;
-
-        uint8_t *pkt = g_inst_win[idx].data;
-        int pkt_len  = g_inst_win[idx].len;
-        uint16_t rid = g_inst_win[idx].rid;
-        if (g_inst_cb && pkt_len > INST_HDR_SIZE)
-            inst_deliver(rid, pkt, pkt_len);  // 传入完整包
-
-        g_inst_win[idx].len = 0;
-        g_inst_next++;
-        count++;;
-    }
-    return count;
-}
-
-// 查找或创建 sender 条目
-static inst_sender_t* inst_find_sender(uint16_t rid) {
-    // 查找现有
-    for (int i = 0; i < g_inst_sender_cnt; i++) {
-        if (g_inst_senders[i].rid == rid) return &g_inst_senders[i];
-    }
-    // 创建新条目
-    if (g_inst_sender_cnt < INST_MAX_SENDERS) {
-        inst_sender_t *s = &g_inst_senders[g_inst_sender_cnt++];
-        s->rid = rid;
-        s->next_seq = 0;
-        s->synced = false;
-        return s;
-    }
-    // 满了，复用最旧的（LRU近似）
-    inst_sender_t *s = &g_inst_senders[0];
-    s->rid = rid;
-    s->next_seq = 0;
-    s->synced = false;
-    return s;
-}
-
 // 接收线程：循环 recvfrom，按 seq 顺序交付到回调
 static int32_t inst_thread_proc(void *ctx) {
     (void)ctx;
@@ -1386,14 +1372,14 @@ static int32_t inst_thread_proc(void *ctx) {
             if (remain < 1) continue;
             uint8_t port_len = *p++; remain--;
             if (remain < port_len) continue;
-            char port_name[INST_WAIT_NAME_MAX + 1];
-            if (port_len > INST_WAIT_NAME_MAX) port_len = INST_WAIT_NAME_MAX;
+            char port_name[INST_WAIT_PORT_MAX + 1];
+            if (port_len > INST_WAIT_PORT_MAX) port_len = INST_WAIT_PORT_MAX;
             memcpy(port_name, p, port_len);
             port_name[port_len] = '\0';
             p += port_len; remain -= port_len;
             // from_len + from（可选，此处不需要解析）
             if (g_inst_cb) {
-                g_inst_cb(rid, INSTRUMENT_CTRL, NULL, port_name, port_len);
+                g_inst_cb(rid, g_inst_ctrl, NULL, port_name, port_len);
             }
             continue;
         }
@@ -1411,8 +1397,8 @@ static int32_t inst_thread_proc(void *ctx) {
             if (remain < 1) continue;
             uint8_t by_len = *p++; remain--;
             if (remain < by_len) by_len = (uint8_t)remain;
-            char by_name[INST_WAIT_NAME_MAX + 1];
-            if (by_len > INST_WAIT_NAME_MAX) by_len = INST_WAIT_NAME_MAX;
+            char by_name[INST_WAIT_PORT_MAX + 1];
+            if (by_len > INST_WAIT_PORT_MAX) by_len = INST_WAIT_PORT_MAX;
             memcpy(by_name, p, by_len);
             by_name[by_len] = '\0';
 
@@ -1433,6 +1419,7 @@ static int32_t inst_thread_proc(void *ctx) {
 
         // 获取该 rid 的序号追踪器
         inst_sender_t *sender = inst_find_sender(rid);
+        if (!sender) continue;                      // OOM
 
         // 首包同步
         if (!sender->synced) {
@@ -1443,21 +1430,43 @@ static int32_t inst_thread_proc(void *ctx) {
         int16_t diff = (int16_t)(seq - sender->next_seq);
         if (diff < 0) continue;                     // 旧包/重复
 
-        // 超出窗口 → 警告并跳跃到新 seq
+        // 超出窗口 → 滑动推进：交付已缓存的有效包，跳过空槽
         if (diff >= INST_WINDOW_SIZE) {
-            log_printf(LOG_SLOT_ERROR, "INSTRUMENT", "[%d] DROP of rid=%u: (seq %u → %u)",
-                       g_inst_rid, rid, sender->next_seq, seq);
-            sender->next_seq = seq;
-            diff = 0;
+            uint16_t advance_to = (uint16_t)(seq - INST_WINDOW_SIZE + 1);
+            int delivered = 0, dropped = 0;
+            while (sender->next_seq != advance_to) {
+                int idx = sender->next_seq & INST_WINDOW_MASK;
+                if (sender->win[idx].len > 0) {
+                    if (g_inst_cb) inst_deliver(rid, sender->win[idx].data, sender->win[idx].len);
+                    sender->win[idx].len = 0;
+                    delivered++;
+                } else dropped++;
+                sender->next_seq++;
+            }
+            log_printf(LOG_SLOT_WARN, "INSTRUMENT", "[%d] SLIDE rid=%u: seq %u→%u (delivered=%d dropped=%d)",
+                       g_inst_rid, rid, (uint16_t)(advance_to - delivered - dropped), seq, delivered, dropped);
+            diff = (int16_t)(seq - sender->next_seq);
         }
 
-        // 直接交付（简化：不使用窗口缓冲，保持顺序由发送方保证）
-        if (g_inst_cb && n > INST_HDR_SIZE) {
-            inst_deliver(rid, buf, n);
+        // 按序到达：直接交付，然后 flush 连续已缓存的包
+        if (diff == 0) {
+            if (g_inst_cb && n > INST_HDR_SIZE) inst_deliver(rid, buf, n);
+            sender->next_seq++;
+            for (;;) {
+                int idx = sender->next_seq & INST_WINDOW_MASK;
+                if (sender->win[idx].len == 0) break;
+                if (g_inst_cb) inst_deliver(rid, sender->win[idx].data, sender->win[idx].len);
+                sender->win[idx].len = 0;
+                sender->next_seq++;
+            }
+        } else {
+            // 0 < diff < WINDOW_SIZE：缓存到窗口槽位，等待前序包到达
+            int idx = seq & INST_WINDOW_MASK;
+            memcpy(sender->win[idx].data, buf, n);
+            sender->win[idx].len = n;
         }
-        sender->next_seq = seq + 1;
-        log_printf(LOG_SLOT_VERBOSE, "INSTRUMENT", "[%d] RECV from rid=%u: seq=%u",
-                   g_inst_rid, rid, seq);
+        log_printf(LOG_SLOT_VERBOSE, "INSTRUMENT", "[%d] RECV rid=%u: seq=%u (next=%u)",
+                   g_inst_rid, rid, seq, sender->next_seq);
     }
     return 0;
 }
