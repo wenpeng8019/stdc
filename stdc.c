@@ -653,6 +653,12 @@ void log_output(cstr_t filename, uint32_t sz_max) {
 
 //-----------------------------------------------------------------------------
 
+static void log_printf(log_level_e level, const char *tag, const char *fmt, ...) {
+    va_list args; va_start(args, fmt);
+    log_slot(level, tag, fmt, args, (log_cb)-1, true);
+    va_end(args);
+}
+
 void log_slot(log_level_e level, const char *tag, const char *fmt, va_list params, log_cb cb_log, bool pre_tag) {
 
     if (cb_log == (log_cb)-2) {
@@ -1020,12 +1026,12 @@ instrument_enabled(uint16_t idx) {
 
 // 发送 type=2 WAIT 包：header(7) + waiting_len(1) + waiting + from_len(1) + from
 // 不占 seq（与选项包相同，接收端不走顺序交付）
-static void inst_send_wait(const char *waiting, const char *from) {
+static void inst_send_wait(const char *port, const char *from) {
     if (g_inst_sock == P_INVALID_SOCKET) return;
 
-    uint8_t waiting_len = waiting ? (uint8_t)strlen(waiting) : 0;
-    uint8_t from_len    = from    ? (uint8_t)strlen(from)    : 0;
-    if (waiting_len > INST_WAIT_NAME_MAX) waiting_len = INST_WAIT_NAME_MAX;
+    uint8_t port_len = port ? (uint8_t)strlen(port) : 0;
+    uint8_t from_len = from ? (uint8_t)strlen(from) : 0;
+    if (port_len > INST_WAIT_NAME_MAX) port_len = INST_WAIT_NAME_MAX;
     if (from_len    > INST_WAIT_NAME_MAX) from_len    = INST_WAIT_NAME_MAX;
 
     uint8_t pkt[INST_HDR_SIZE + 2 + INST_WAIT_NAME_MAX * 2];
@@ -1036,8 +1042,8 @@ static void inst_send_wait(const char *waiting, const char *from) {
     pkt[6] = 0;                                     // tag_len=0
 
     uint8_t *p = pkt + INST_HDR_SIZE;
-    *p++ = waiting_len;
-    if (waiting_len) { memcpy(p, waiting, waiting_len); p += waiting_len; }
+    *p++ = port_len;
+    if (port_len) { memcpy(p, port, port_len); p += port_len; }
     *p++ = from_len;
     if (from_len)    { memcpy(p, from, from_len); p += from_len; }
 
@@ -1071,7 +1077,7 @@ static void inst_send_continue(const char *to, const char *by) {
            (struct sockaddr*)&g_inst_dest, sizeof(g_inst_dest));
 }
 
-ret_t instrument_wait(cstr_t waiting, cstr_t from, uint32_t timeout_ms) {
+ret_t instrument_wait(cstr_t port, cstr_t from, uint32_t timeout_ms) {
 
     if (g_inst_sock == P_INVALID_SOCKET && !inst_init_sock())
         return E_EXTERNAL(P_sock_errno());
@@ -1108,7 +1114,7 @@ ret_t instrument_wait(cstr_t waiting, cstr_t from, uint32_t timeout_ms) {
     ret_t ret = E_TIMEOUT;
 
     for (;;) {
-        inst_send_wait(waiting, from);
+        inst_send_wait(port, from);
 
         // 等待一个重发间隔或直到收到 continue
         P_clock _clk_wait;
@@ -1368,6 +1374,8 @@ static int32_t inst_thread_proc(void *ctx) {
         // type=1 选项包：直接处理，不走顺序交付
         if (type == 1) {
             inst_handle_bits(buf + INST_HDR_SIZE, n - INST_HDR_SIZE);
+            log_printf(LOG_SLOT_DEBUG, "INSTRUMENT", "[%d] OPTIONS sync rid=%u: byte_idx=%u byte_val=0x%02X", 
+                       g_inst_rid, rid, nget_s(buf + INST_HDR_SIZE), buf[INST_HDR_SIZE + 2]);
             continue;
         }
 
@@ -1376,16 +1384,16 @@ static int32_t inst_thread_proc(void *ctx) {
             uint8_t *p = buf + INST_HDR_SIZE;
             int remain = n - INST_HDR_SIZE;
             if (remain < 1) continue;
-            uint8_t waiting_len = *p++; remain--;
-            if (remain < waiting_len) continue;
-            char waiting_name[INST_WAIT_NAME_MAX + 1];
-            if (waiting_len > INST_WAIT_NAME_MAX) waiting_len = INST_WAIT_NAME_MAX;
-            memcpy(waiting_name, p, waiting_len);
-            waiting_name[waiting_len] = '\0';
-            p += waiting_len; remain -= waiting_len;
+            uint8_t port_len = *p++; remain--;
+            if (remain < port_len) continue;
+            char port_name[INST_WAIT_NAME_MAX + 1];
+            if (port_len > INST_WAIT_NAME_MAX) port_len = INST_WAIT_NAME_MAX;
+            memcpy(port_name, p, port_len);
+            port_name[port_len] = '\0';
+            p += port_len; remain -= port_len;
             // from_len + from（可选，此处不需要解析）
             if (g_inst_cb) {
-                g_inst_cb(rid, INSTRUMENT_CTRL, NULL, waiting_name, waiting_len);
+                g_inst_cb(rid, INSTRUMENT_CTRL, NULL, port_name, port_len);
             }
             continue;
         }
@@ -1407,10 +1415,16 @@ static int32_t inst_thread_proc(void *ctx) {
             if (by_len > INST_WAIT_NAME_MAX) by_len = INST_WAIT_NAME_MAX;
             memcpy(by_name, p, by_len);
             by_name[by_len] = '\0';
-            // 检查 from 过滤
-            if (g_inst_wait_from[0] && strcmp(g_inst_wait_from, by_name) != 0)
-                continue;                           // 不匹配期望的 from，忽略
-            g_inst_wait_done = true;
+
+            // 不匹配期望的 from，忽略
+            if (g_inst_wait_from[0] && strcmp(g_inst_wait_from, by_name) != 0) {
+                log_printf(LOG_SLOT_DEBUG, "INSTRUMENT", "[%d] CONTINUE by rid=%u ignored: expected from '%s', but got '%s'",
+                           g_inst_rid, rid, g_inst_wait_from, by_name);
+            } else { g_inst_wait_done = true;
+                log_printf(LOG_SLOT_DEBUG, "INSTRUMENT", "[%d] CONTINUE by rid=%u accepted: '%s'/'%s'",
+                           g_inst_rid, rid, by_name, g_inst_wait_from[0] ? g_inst_wait_from : "any");
+            }
+            
             continue;
         }
 
@@ -1431,8 +1445,8 @@ static int32_t inst_thread_proc(void *ctx) {
 
         // 超出窗口 → 警告并跳跃到新 seq
         if (diff >= INST_WINDOW_SIZE) {
-            fprintf(stderr, "inst: rid=%u lost %d packets (seq %u → %u)\n",
-                    rid, (int)diff, sender->next_seq, seq);
+            log_printf(LOG_SLOT_ERROR, "INSTRUMENT", "[%d] DROP of rid=%u: (seq %u → %u)",
+                       g_inst_rid, rid, sender->next_seq, seq);
             sender->next_seq = seq;
             diff = 0;
         }
@@ -1442,6 +1456,8 @@ static int32_t inst_thread_proc(void *ctx) {
             inst_deliver(rid, buf, n);
         }
         sender->next_seq = seq + 1;
+        log_printf(LOG_SLOT_VERBOSE, "INSTRUMENT", "[%d] RECV from rid=%u: seq=%u",
+                   g_inst_rid, rid, seq);
     }
     return 0;
 }

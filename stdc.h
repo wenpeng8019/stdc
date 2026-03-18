@@ -361,14 +361,14 @@ bool instrument_enabled(uint16_t idx);
 
 /**
  * @brief                       阻塞等待对端调用 instrument_continue
- * @param waiting               本方名称（广播给对端，作为 WAIT 消息内容）
+ * @param port                  本方名称（广播给对端，作为 WAIT 消息内容）
  * @param from                  期望的应答方名称（NULL 或空串表示任意方均可中断）
  * @param timeout_ms            超时时间（毫秒），0 表示无限等待
  * @return                      E_NONE 收到 continue，E_TIMEOUT 超时
  * @note                        内部定期广播 WAIT 包，收到匹配的 CONTINUE 后返回
  *                              WAIT 消息通过 instrument_cb(rid, 255, NULL, waiting, len) 通知监听方
  */
-ret_t instrument_wait(cstr_t waiting, cstr_t from, uint32_t timeout_ms);
+ret_t instrument_wait(cstr_t port, cstr_t from, uint32_t timeout_ms);
 
 /**
  * @brief                       发送 CONTINUE 应答，中断对端的 instrument_wait
