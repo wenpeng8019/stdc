@@ -36,6 +36,7 @@ static uint8_t                  g_inst_ctrl   = INSTRUMENT_CTRL;    // 可通过
 // 本地回调和监听
 static instrument_cb            g_inst_cb     = NULL;
 static TLS int                  g_inst_in_cb  = 0;                  // 防止回调递归
+static log_cb                   g_inst_log_cb = NULL;               // instrument 内部日志回调
 
 // 本地选项 bitset
 static uint8_t*                 g_inst_bits     = NULL;             // 动态分配
@@ -102,8 +103,6 @@ static void inst_send_buf(uint8_t chn, char* buf, int tag_len, int text_len);
 #else
 #define LOG_HDR_RESERVE         0
 #endif
-//-----------------------------------------------------------------------------
-
 ///////////////////////////////////////////////////////////////////////////////
 
 /**
@@ -659,7 +658,10 @@ void log_output(cstr_t filename, uint32_t sz_max) {
 
 static void log_printf(log_level_e level, const char *tag, const char *fmt, ...) {
     va_list args; va_start(args, fmt);
-    log_slot(level, tag, fmt, args, (log_cb)-1, true);
+    if (g_inst_log_cb)
+        log_slot(level, tag, fmt, args, g_inst_log_cb, true);
+    else if (g_inst_cb)
+        instrument_slot(level, tag, fmt, args);
     va_end(args);
 }
 
@@ -674,9 +676,9 @@ void log_slot(log_level_e level, const char *tag, const char *fmt, va_list param
         #endif
     }
 
-    static __thread char        g_line[LOG_HDR_RESERVE + 256 + LOG_LINE_MAX];
-    static __thread int         g_logging = -1;         // -1: 默认模式，0: 开启缓存模式（缓存内容为空），>0: 缓存模式且已写入内容
-    char* const                 buf = g_line + LOG_HDR_RESERVE + 256;     // 日志输出起始位置
+    static TLS int          g_logging = -1;         // -1: 默认模式，0: 开启缓存模式（缓存内容为空），>0: 缓存模式且已写入内容
+    static TLS char         g_line[LOG_HDR_RESERVE + 256 + LOG_LINE_MAX];
+    char* const             buf = g_line + LOG_HDR_RESERVE + 256;     // 日志输出起始位置
 
     // 如果 tag 为空，表示输出日志到缓存
     if (!tag) {
@@ -867,6 +869,11 @@ instrument_ctrl(uint16_t chn) {
     
     assert(g_inst_sock == P_INVALID_SOCKET);        // 必须在首次使用前调用
     g_inst_ctrl = (uint8_t)chn;
+}
+
+void
+instrument_loggable(log_cb cb) {
+    g_inst_log_cb = cb;
 }
 
 void
@@ -1166,7 +1173,7 @@ instrument_listen(instrument_cb cb, cstr_t id) {
         return E_EXTERNAL(P_sock_errno());
 
     inst_free_senders();
-    g_inst_cb     = cb;
+    g_inst_cb      = cb;
     if (id) {
         g_inst_id_set = true;
         size_t n = strlen(id);
@@ -1519,12 +1526,11 @@ static int32_t inst_thread_proc(void *ctx) {
             // 不匹配期望的 from，忽略
             if (g_inst_wait_from[0] && strcmp(g_inst_wait_from, by_name) != 0) {
                 log_printf(LOG_SLOT_DEBUG, "INSTRUMENT", "[%d] CONTINUE by rid=%u ignored: expected from '%s', but got '%s'\n",
-                           g_inst_rid, rid, g_inst_wait_from, by_name);
+                        g_inst_rid, rid, g_inst_wait_from, by_name);
             } else { g_inst_wait_done = true;
                 log_printf(LOG_SLOT_DEBUG, "INSTRUMENT", "[%d] CONTINUE by rid=%u accepted: '%s'/'%s'\n",
-                           g_inst_rid, rid, by_name, g_inst_wait_from[0] ? g_inst_wait_from : "any");
+                        g_inst_rid, rid, by_name, g_inst_wait_from[0] ? g_inst_wait_from : "any");
             }
-            
             continue;
         }
 
@@ -1580,9 +1586,9 @@ static int32_t inst_thread_proc(void *ctx) {
                 memcpy(g_inst_req_buf, p, nr);
                 g_inst_req_buf[nr] = '\0';
             }
-            log_printf(LOG_SLOT_DEBUG, "INSTRUMENT", "[%d] RESP from rid=%u: %d bytes\n",
-                       g_inst_rid, rid, remain);
             g_inst_req_done = true;
+            log_printf(LOG_SLOT_DEBUG, "INSTRUMENT", "[%d] RESP from rid=%u: %d bytes\n",
+                    g_inst_rid, rid, remain);
             continue;
         }
 
@@ -1619,9 +1625,10 @@ static int32_t inst_thread_proc(void *ctx) {
                 } else dropped++;
                 sender->next_seq++;
             }
-            if (!is_echo) 
+            if (!is_echo) {
                 log_printf(LOG_SLOT_WARN, "INSTRUMENT", "[%d] SLIDE rid=%u: seq %u→%u (delivered=%d dropped=%d)\n",
-                           g_inst_rid, rid, (uint16_t)(advance_to - delivered - dropped), seq, delivered, dropped);
+                            g_inst_rid, rid, (uint16_t)(advance_to - delivered - dropped), seq, delivered, dropped);
+            }
             diff = (int16_t)(seq - sender->next_seq);
         }
 
@@ -1642,9 +1649,10 @@ static int32_t inst_thread_proc(void *ctx) {
             memcpy(sender->win[idx].data, buf, n);
             sender->win[idx].len = n;
         }
-        if (!is_echo)
+        if (!is_echo) {
             log_printf(LOG_SLOT_VERBOSE, "INSTRUMENT", "[%d] RECV rid=%u: seq=%u (next=%u)\n",
-                    g_inst_rid, rid, seq, sender->next_seq);
+                        g_inst_rid, rid, seq, sender->next_seq);
+        }
     }
     return 0;
 }

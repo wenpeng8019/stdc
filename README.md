@@ -333,7 +333,8 @@ instrument_port(1981);          // 设置端口（默认 1980）
 instrument_ctrl(200);           // 设置控制通道（默认 255）
 
 // 监听端：接收并按 seq 顺序交付（每个发送方独立滑动窗口）
-instrument_listen(my_callback, NULL);   // NULL=不接受 req，""=接受所有，"name"=精确匹配
+instrument_listen(my_callback, NULL);   // NULL=不接受 req，""接受所有，"name"精确匹配
+instrument_loggable((log_cb)-1);        // 启用 instrument 内部日志
 void my_callback(uint16_t rid, uint8_t chn, const char* tag, char *txt, int len) {
     // rid: 发送方随机 ID（本地回调时为 0）
     // tag: 消息标签（WAIT/CONTINUE 包时为 NULL）
