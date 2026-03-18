@@ -42,7 +42,7 @@ static uint8_t*                 g_inst_bits     = NULL;             // 动态分
 static uint16_t                 g_inst_bits_len = 0;                // 已分配字节数
 
 // instrument tick 机制，用于 P_tick_xxx() 相关操作
-int64_t                         instrument_waiting = 0;             // <=0: 累计等待时长(us)取反; >0: 冻结tick_us
+int64_t                         instrument_tick = 0;               // <=0: 累计等待时长(us)取反; >0: 冻结tick_us
 
 // 本地端口和通讯
 static uint16_t                 g_inst_rid    = 0;                  // 本节点随机 ID
@@ -1027,6 +1027,10 @@ static bool inst_init_sock(void) {
     // 设置接收超时（100ms），供线程周期性检查 g_inst_running
     P_sock_rcvtimeo(g_inst_sock, 100);
 
+    // 增大接收缓冲区（默认通常 ~200KB，高频发送时容易溢出丢包）
+    int rcvbuf = 1024 * 1024;  // 1MB
+    setsockopt(g_inst_sock, SOL_SOCKET, SO_RCVBUF, (const char*)&rcvbuf, sizeof(rcvbuf));
+
     atexit(inst_cleanup);
     return true;
 }
@@ -1135,7 +1139,8 @@ inst_send_buf(uint8_t chn, char* buf, int tag_len, int text_len) {
     // 写入固定 header (7 bytes)
     uint8_t *pkt = (uint8_t*)buf;
     nwrite_s(pkt, g_inst_rid);                      // rid
-    nwrite_s(pkt + 2, g_inst_seq++);                // seq
+    uint16_t seq = (uint16_t)P_get_and_inc(&g_inst_seq, 1);
+    nwrite_s(pkt + 2, seq);                         // seq
     pkt[4] = 0;                                     // type=0 数据包
     pkt[5] = chn;                                   // chn
     pkt[6] = (uint8_t)tag_len;                      // tag_len
@@ -1241,10 +1246,10 @@ ret_t instrument_wait(cstr_t port, cstr_t from, uint32_t timeout_ms) {
     }
 
     // 进入 wait：将累计负值转换为冻结正值
-    // instrument_waiting <= 0 时，调整后 tick_us = clock_us + instrument_waiting
+    // instrument_tick <= 0 时，调整后 tick_us = clock_us + instrument_tick
     // 设为正值，即冻结在当前调整时刻
     P_clock _clk_now; P_clock_now(&_clk_now);
-    instrument_waiting = (int64_t)(clock_us(_clk_now)) + instrument_waiting;
+    instrument_tick = (int64_t)(clock_us(_clk_now)) + instrument_tick;
 
     P_clock _clk_start;
     P_clock_now(&_clk_start);
@@ -1273,7 +1278,7 @@ ret_t instrument_wait(cstr_t port, cstr_t from, uint32_t timeout_ms) {
     // 退出 wait：将冻结正值恢复为累计负值
     // frozen_tick_us - current_clock_us = 负值（累计增大）
     P_clock_now(&_clk_now);
-    instrument_waiting = instrument_waiting - (int64_t)(clock_us(_clk_now));
+    instrument_tick = instrument_tick - (int64_t)(clock_us(_clk_now));
     return ret;
 }
 
@@ -1360,7 +1365,7 @@ static int32_t inst_thread_proc(void *ctx) {
         // type=1 选项包：直接处理，不走顺序交付
         if (type == 1) {
             inst_handle_bits(buf + INST_HDR_SIZE, n - INST_HDR_SIZE);
-            log_printf(LOG_SLOT_DEBUG, "INSTRUMENT", "[%d] OPTIONS sync rid=%u: byte_idx=%u byte_val=0x%02X", 
+            log_printf(LOG_SLOT_DEBUG, "INSTRUMENT", "[%d] OPTIONS sync rid=%u: byte_idx=%u byte_val=0x%02X\n", 
                        g_inst_rid, rid, nget_s(buf + INST_HDR_SIZE), buf[INST_HDR_SIZE + 2]);
             continue;
         }
@@ -1404,10 +1409,10 @@ static int32_t inst_thread_proc(void *ctx) {
 
             // 不匹配期望的 from，忽略
             if (g_inst_wait_from[0] && strcmp(g_inst_wait_from, by_name) != 0) {
-                log_printf(LOG_SLOT_DEBUG, "INSTRUMENT", "[%d] CONTINUE by rid=%u ignored: expected from '%s', but got '%s'",
+                log_printf(LOG_SLOT_DEBUG, "INSTRUMENT", "[%d] CONTINUE by rid=%u ignored: expected from '%s', but got '%s'\n",
                            g_inst_rid, rid, g_inst_wait_from, by_name);
             } else { g_inst_wait_done = true;
-                log_printf(LOG_SLOT_DEBUG, "INSTRUMENT", "[%d] CONTINUE by rid=%u accepted: '%s'/'%s'",
+                log_printf(LOG_SLOT_DEBUG, "INSTRUMENT", "[%d] CONTINUE by rid=%u accepted: '%s'/'%s'\n",
                            g_inst_rid, rid, by_name, g_inst_wait_from[0] ? g_inst_wait_from : "any");
             }
             
@@ -1416,6 +1421,10 @@ static int32_t inst_thread_proc(void *ctx) {
 
         // type!=0 未知类型，丢弃
         if (type != 0) continue;
+
+        // 回环检测：INSTRUMENT 内部日志已是 ACK，不再生成 INSTRUMENT 诊断日志
+        uint8_t pkt_tag_len = buf[6];
+        bool is_echo = (pkt_tag_len == 10 && memcmp(buf + INST_HDR_SIZE, "INSTRUMENT", 10) == 0);
 
         // 获取该 rid 的序号追踪器
         inst_sender_t *sender = inst_find_sender(rid);
@@ -1443,8 +1452,9 @@ static int32_t inst_thread_proc(void *ctx) {
                 } else dropped++;
                 sender->next_seq++;
             }
-            log_printf(LOG_SLOT_WARN, "INSTRUMENT", "[%d] SLIDE rid=%u: seq %u→%u (delivered=%d dropped=%d)",
-                       g_inst_rid, rid, (uint16_t)(advance_to - delivered - dropped), seq, delivered, dropped);
+            if (!is_echo) 
+                log_printf(LOG_SLOT_WARN, "INSTRUMENT", "[%d] SLIDE rid=%u: seq %u→%u (delivered=%d dropped=%d)\n",
+                           g_inst_rid, rid, (uint16_t)(advance_to - delivered - dropped), seq, delivered, dropped);
             diff = (int16_t)(seq - sender->next_seq);
         }
 
@@ -1465,8 +1475,9 @@ static int32_t inst_thread_proc(void *ctx) {
             memcpy(sender->win[idx].data, buf, n);
             sender->win[idx].len = n;
         }
-        log_printf(LOG_SLOT_VERBOSE, "INSTRUMENT", "[%d] RECV rid=%u: seq=%u (next=%u)",
-                   g_inst_rid, rid, seq, sender->next_seq);
+        if (!is_echo)
+            log_printf(LOG_SLOT_VERBOSE, "INSTRUMENT", "[%d] RECV rid=%u: seq=%u (next=%u)\n",
+                    g_inst_rid, rid, seq, sender->next_seq);
     }
     return 0;
 }

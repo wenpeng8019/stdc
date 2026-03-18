@@ -862,7 +862,7 @@ ret_t instrument_continue(cstr_t to, cstr_t from);
 
 // 全局变量：跟踪 wait 累计时间，用于 tick 计时修正
 // <=0: 累计等待时长 (us) 取反；>0: wait 中冻结的 tick_us
-extern int64_t instrument_waiting;
+extern int64_t instrument_tick;
 ```
 
 ### 广播模式
