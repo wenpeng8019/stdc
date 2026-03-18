@@ -84,9 +84,15 @@ typedef struct inst_sender_s {
 static inst_sender_t           *g_inst_senders = NULL;
 
 // wait/continue 握手状态
-#define INST_WAIT_PORT_MAX      32                                  // 等待端口最大长度
-static char                     g_inst_wait_from[INST_WAIT_PORT_MAX]; // 期望的 from（空串=任意方）
+static char                     g_inst_wait_from[INST_PORT_MAX]; // 期望的 from（空串=任意方）
 static volatile bool            g_inst_wait_done  = false;          // continue 已收到
+static char                     g_inst_id[INST_PORT_MAX];      // instrument_listen 注册的 id
+static bool                     g_inst_id_set = false;              // id 是否已设置（false=不接受 req）
+
+// req/resp 握手状态
+static volatile bool            g_inst_req_done   = false;          // resp 已收到
+static char*                    g_inst_req_buf    = NULL;           // 请求方 buffer 指针
+static size_t                   g_inst_req_bufsz  = 0;              // buffer 大小
 
 // 前向声明
 static void inst_send_buf(uint8_t chn, char* buf, int tag_len, int text_len);
@@ -1151,7 +1157,7 @@ inst_send_buf(uint8_t chn, char* buf, int tag_len, int text_len) {
 }
 
 ret_t
-instrument_listen(instrument_cb cb) {
+instrument_listen(instrument_cb cb, cstr_t id) {
 
     // 监听操作：需要启动接收线程
     if (g_inst_sock == P_INVALID_SOCKET && !inst_init_sock())
@@ -1161,6 +1167,16 @@ instrument_listen(instrument_cb cb) {
 
     inst_free_senders();
     g_inst_cb     = cb;
+    if (id) {
+        g_inst_id_set = true;
+        size_t n = strlen(id);
+        if (n >= INST_PORT_MAX) n = INST_PORT_MAX - 1;
+        memcpy(g_inst_id, id, n);
+        g_inst_id[n] = '\0';
+    } else {
+        g_inst_id_set = false;
+        g_inst_id[0] = '\0';
+    }
 
     return E_NONE;
 }
@@ -1174,10 +1190,10 @@ static void inst_send_wait(const char *port, const char *from) {
 
     uint8_t port_len = port ? (uint8_t)strlen(port) : 0;
     uint8_t from_len = from ? (uint8_t)strlen(from) : 0;
-    if (port_len > INST_WAIT_PORT_MAX) port_len = INST_WAIT_PORT_MAX;
-    if (from_len    > INST_WAIT_PORT_MAX) from_len    = INST_WAIT_PORT_MAX;
+    if (port_len > INST_PORT_MAX) port_len = INST_PORT_MAX;
+    if (from_len    > INST_PORT_MAX) from_len    = INST_PORT_MAX;
 
-    uint8_t pkt[INST_HDR_SIZE + 2 + INST_WAIT_PORT_MAX * 2];
+    uint8_t pkt[INST_HDR_SIZE + 2 + INST_PORT_MAX * 2];
     nwrite_s(pkt, g_inst_rid);                      // rid
     nwrite_s(pkt + 2, 0);                           // seq（不占序列号）
     pkt[4] = 2;                                     // type=2 WAIT 包
@@ -1200,10 +1216,10 @@ static void inst_send_continue(const char *to, const char *by) {
 
     uint8_t to_len = to ? (uint8_t)strlen(to) : 0;
     uint8_t by_len = by ? (uint8_t)strlen(by) : 0;
-    if (to_len > INST_WAIT_PORT_MAX) to_len = INST_WAIT_PORT_MAX;
-    if (by_len > INST_WAIT_PORT_MAX) by_len = INST_WAIT_PORT_MAX;
+    if (to_len > INST_PORT_MAX) to_len = INST_PORT_MAX;
+    if (by_len > INST_PORT_MAX) by_len = INST_PORT_MAX;
 
-    uint8_t pkt[INST_HDR_SIZE + 2 + INST_WAIT_PORT_MAX * 2];
+    uint8_t pkt[INST_HDR_SIZE + 2 + INST_PORT_MAX * 2];
     nwrite_s(pkt, g_inst_rid);                      // rid
     nwrite_s(pkt + 2, 0);                           // seq（不占序列号）
     pkt[4] = 3;                                     // type=3 CONTINUE 包
@@ -1231,7 +1247,7 @@ ret_t instrument_wait(cstr_t port, cstr_t from, uint32_t timeout_ms) {
     g_inst_wait_done = false;
     if (from && from[0]) {
         size_t n = strlen(from);
-        if (n >= INST_WAIT_PORT_MAX) n = INST_WAIT_PORT_MAX - 1;
+        if (n >= INST_PORT_MAX) n = INST_PORT_MAX - 1;
         memcpy(g_inst_wait_from, from, n);
         g_inst_wait_from[n] = '\0';
     } else {
@@ -1288,6 +1304,99 @@ ret_t instrument_continue(cstr_t to, cstr_t from) {
         return E_EXTERNAL(P_sock_errno());
 
     inst_send_continue(to, from);
+    return E_NONE;
+}
+
+ret_t instrument_req(cstr_t id, uint32_t timeout_ms,
+                     cstr_t msg, char *buffer, size_t bufsz) {
+
+    if (g_inst_sock == P_INVALID_SOCKET && !inst_init_sock())
+        return E_EXTERNAL(P_sock_errno());
+    if (g_inst_thread == 0 && !inst_start_thread())
+        return E_EXTERNAL(P_sock_errno());
+
+    // 构建 REQ 包（一次构建，重复发送）
+    // 格式: header(7) + id_len(1) + id + msg_len(1) + msg + content
+    uint8_t id_len = id ? (uint8_t)strlen(id) : 0;
+    uint8_t msg_len = msg ? (uint8_t)strlen(msg) : 0;
+    if (id_len > INST_PORT_MAX) id_len = INST_PORT_MAX;
+    if (msg_len > INST_PORT_MAX) msg_len = INST_PORT_MAX;
+
+    int content_len = buffer ? (int)strlen(buffer) : 0;
+    int max_content = INST_PAYLOAD_MAX - 2 - id_len - msg_len;
+    if (content_len > max_content) content_len = max_content;
+
+    uint8_t pkt[INST_UDP_MAX];
+    nwrite_s(pkt, g_inst_rid);
+    nwrite_s(pkt + 2, 0);                           // seq（不占序列号）
+    pkt[4] = 4;                                      // type=4 REQ 包
+    pkt[5] = g_inst_ctrl;
+    pkt[6] = 0;                                      // tag_len=0
+
+    uint8_t *p = pkt + INST_HDR_SIZE;
+    *p++ = id_len;
+    if (id_len) { memcpy(p, id, id_len); p += id_len; }
+    *p++ = msg_len;
+    if (msg_len) { memcpy(p, msg, msg_len); p += msg_len; }
+    if (content_len > 0) { memcpy(p, buffer, content_len); p += content_len; }
+    int pkt_len = (int)(p - pkt);
+
+    // 设置等待状态
+    g_inst_req_done = false;
+    g_inst_req_buf = buffer;
+    g_inst_req_bufsz = bufsz;
+
+    P_clock _clk_start, _clk_now;
+    P_clock_now(&_clk_start);
+    uint64_t resend_interval = 500;                 // 每 500ms 重发一次 REQ
+    ret_t ret = E_TIMEOUT;
+
+    for (;;) {
+        sendto(g_inst_sock, (const char*)pkt, pkt_len, 0,
+               (struct sockaddr*)&g_inst_dest, sizeof(g_inst_dest));
+
+        P_clock _clk_wait;
+        P_clock_now(&_clk_wait);
+        while (!g_inst_req_done) {
+            P_clock_now(&_clk_now);
+            if ((uint64_t)clock_ms_diff(_clk_now, _clk_wait) >= resend_interval) break;
+            P_usleep(10000);                        // 10ms 轮询
+        }
+
+        if (g_inst_req_done) { ret = E_NONE; break; }
+
+        P_clock_now(&_clk_now);
+        uint64_t elapsed_ms = clock_ms_diff(_clk_now, _clk_start);
+        if (timeout_ms > 0 && elapsed_ms >= timeout_ms) break;
+    }
+
+    g_inst_req_buf = NULL;
+    return ret;
+}
+
+ret_t instrument_resp(uint16_t rid, cstr_t reply) {
+
+    if (g_inst_sock == P_INVALID_SOCKET && !inst_init_sock())
+        return E_EXTERNAL(P_sock_errno());
+
+    // 格式: header(7) + target_rid(2) + reply
+    int reply_len = reply ? (int)strlen(reply) : 0;
+    int avail = INST_PAYLOAD_MAX - 2;                // target_rid(2)
+    if (reply_len > avail) reply_len = avail;
+
+    uint8_t pkt[INST_UDP_MAX];
+    nwrite_s(pkt, g_inst_rid);
+    nwrite_s(pkt + 2, 0);                           // seq（不占序列号）
+    pkt[4] = 5;                                      // type=5 RESP 包
+    pkt[5] = g_inst_ctrl;
+    pkt[6] = 0;                                      // tag_len=0
+
+    uint8_t *p = pkt + INST_HDR_SIZE;
+    nwrite_s(p, rid); p += 2;                        // target_rid
+    if (reply_len > 0) { memcpy(p, reply, reply_len); p += reply_len; }
+
+    sendto(g_inst_sock, (const char*)pkt, (int)(p - pkt), 0,
+           (struct sockaddr*)&g_inst_dest, sizeof(g_inst_dest));
     return E_NONE;
 }
 
@@ -1377,8 +1486,8 @@ static int32_t inst_thread_proc(void *ctx) {
             if (remain < 1) continue;
             uint8_t port_len = *p++; remain--;
             if (remain < port_len) continue;
-            char port_name[INST_WAIT_PORT_MAX + 1];
-            if (port_len > INST_WAIT_PORT_MAX) port_len = INST_WAIT_PORT_MAX;
+            char port_name[INST_PORT_MAX + 1];
+            if (port_len > INST_PORT_MAX) port_len = INST_PORT_MAX;
             memcpy(port_name, p, port_len);
             port_name[port_len] = '\0';
             p += port_len; remain -= port_len;
@@ -1402,8 +1511,8 @@ static int32_t inst_thread_proc(void *ctx) {
             if (remain < 1) continue;
             uint8_t by_len = *p++; remain--;
             if (remain < by_len) by_len = (uint8_t)remain;
-            char by_name[INST_WAIT_PORT_MAX + 1];
-            if (by_len > INST_WAIT_PORT_MAX) by_len = INST_WAIT_PORT_MAX;
+            char by_name[INST_PORT_MAX + 1];
+            if (by_len > INST_PORT_MAX) by_len = INST_PORT_MAX;
             memcpy(by_name, p, by_len);
             by_name[by_len] = '\0';
 
@@ -1416,6 +1525,64 @@ static int32_t inst_thread_proc(void *ctx) {
                            g_inst_rid, rid, by_name, g_inst_wait_from[0] ? g_inst_wait_from : "any");
             }
             
+            continue;
+        }
+
+        // type=4 REQ 包：解析 id、msg、content，匹配 g_inst_id 后通过 cb 通知
+        if (type == 4) {
+            uint8_t *p = buf + INST_HDR_SIZE;
+            int remain = n - INST_HDR_SIZE;
+            if (remain < 1) continue;
+            uint8_t id_len = *p++; remain--;
+            if (remain < id_len) continue;
+            if (id_len > INST_PORT_MAX) id_len = INST_PORT_MAX;
+            char id_name[INST_PORT_MAX + 1];
+            memcpy(id_name, p, id_len);
+            id_name[id_len] = '\0';
+            p += id_len; remain -= id_len;
+
+            // 匹配目标 id：未设置则不接受，空串接受所有，否则精确匹配
+            if (!g_inst_id_set) continue;
+            if (g_inst_id[0] && strcmp(g_inst_id, id_name) != 0) continue;
+
+            if (remain < 1) continue;
+            uint8_t msg_len = *p++; remain--;
+            if (remain < msg_len) continue;
+            if (msg_len > INST_PORT_MAX) msg_len = INST_PORT_MAX;
+            char msg_tag[INST_PORT_MAX + 1];
+            memcpy(msg_tag, p, msg_len);
+            msg_tag[msg_len] = '\0';
+            p += msg_len; remain -= msg_len;
+
+            int content_len = remain > 0 ? remain : 0;
+
+            if (g_inst_cb && msg_len > 0) {
+                // txt = content（请求内容），tag = msg
+                char cb_buf[INST_UDP_MAX + 1];
+                if (content_len > 0) memcpy(cb_buf, p, content_len);
+                cb_buf[content_len] = '\0';
+                g_inst_cb(rid, g_inst_ctrl, msg_tag, cb_buf, content_len);
+            }
+            continue;
+        }
+
+        // type=5 RESP 包：检查目标 rid，写入请求方 buffer
+        if (type == 5) {
+            uint8_t *p = buf + INST_HDR_SIZE;
+            int remain = n - INST_HDR_SIZE;
+            if (remain < 2) continue;                // target_rid(2)
+            uint16_t target_rid = nget_s(p); p += 2; remain -= 2;
+            if (target_rid != g_inst_rid) continue;
+
+            if (g_inst_req_buf && g_inst_req_bufsz > 0) {
+                size_t sz = g_inst_req_bufsz;
+                size_t nr = (size_t)remain < sz - 1 ? (size_t)remain : sz - 1;
+                memcpy(g_inst_req_buf, p, nr);
+                g_inst_req_buf[nr] = '\0';
+            }
+            log_printf(LOG_SLOT_DEBUG, "INSTRUMENT", "[%d] RESP from rid=%u: %d bytes\n",
+                       g_inst_rid, rid, remain);
+            g_inst_req_done = true;
             continue;
         }
 

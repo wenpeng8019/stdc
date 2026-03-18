@@ -333,7 +333,7 @@ instrument_port(1981);          // 设置端口（默认 1980）
 instrument_ctrl(200);           // 设置控制通道（默认 255）
 
 // 监听端：接收并按 seq 顺序交付（每个发送方独立滑动窗口）
-instrument_listen(my_callback);
+instrument_listen(my_callback, NULL);   // NULL=不接受 req，""=接受所有，"name"=精确匹配
 void my_callback(uint16_t rid, uint8_t chn, const char* tag, char *txt, int len) {
     // rid: 发送方随机 ID（本地回调时为 0）
     // tag: 消息标签（WAIT/CONTINUE 包时为 NULL）
@@ -415,7 +415,7 @@ P_check(expr, action);          // 运行时断言
 
 ### 分布式监控 (Instrument)
 - `instrument_port()` / `instrument_ctrl()` - 设置通信端口和控制通道
-- `instrument_listen()` - 启动监听，每个发送方独立滑动窗口按序交付
+- `instrument_listen()` - 启动监听，指定 id 和回调，每个发送方独立滑动窗口按序交付
 - `instrument_local(0)` - 设置本地模式（只本地回调，不网络）
 - `instrument_local('x', 0)` - 保留指定通道发送网络
 - `instrument_remote()` - 设置远程模式（局域网组播）
@@ -423,6 +423,7 @@ P_check(expr, action);          // 运行时断言
 - `instrument_set()` / `instrument_get()` - 选项控制（绝对索引）
 - `instrument_enable()` / `instrument_option()` - 选项控制宏（加 `INSTRUMENT_OPT_BASE` 偏移）
 - `instrument_wait()` / `instrument_continue()` - 跨进程同步等待
+- `instrument_req()` / `instrument_resp()` - 跨进程同步请求/响应
 - 编译时定义 `LOG_INSTRUMENT` 启用，`INSTRUMENT_OPT_BASE` 设置选项基址
 
 ### 终端

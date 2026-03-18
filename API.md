@@ -797,9 +797,10 @@ void instrument_ctrl(uint16_t chn);
 
 ```c
 // 启动监听，按 seq 顺序交付消息到回调
+// id: 本方标识（NULL=不接受任何 req，空串=接受所有 req，非空=精确匹配）
 // 内部启动接收线程，处理乱序和丢包
 // 每个发送方独立滑动窗口，丢包时输出 stderr 警告
-ret_t instrument_listen(instrument_cb cb);
+ret_t instrument_listen(instrument_cb cb, cstr_t id);
 
 // 设置本地模式（只触发本地回调，不网络）
 // 参数: keep_chn, ... 以 0 结尾的通道列表，这些通道仍发送网络
@@ -863,6 +864,22 @@ ret_t instrument_continue(cstr_t to, cstr_t from);
 // 全局变量：跟踪 wait 累计时间，用于 tick 计时修正
 // <=0: 累计等待时长 (us) 取反；>0: wait 中冻结的 tick_us
 extern int64_t instrument_tick;
+
+// 向目标发送请求并同步等待响应（串行，不支持并发）
+// id:         目标方标识（匹配对方 instrument_listen 注册的 id）
+// timeout_ms: 超时时间（毫秒），0 表示无限等待
+// msg:        请求标签（非 NULL，通过 instrument_cb 的 tag 参数传递）
+// buffer:     入参：请求内容；出参：响应内容
+// bufsz:      buffer 大小
+// 返回: E_NONE 收到响应，E_TIMEOUT 超时
+// 接收方通过 instrument_cb(rid, ctrl, msg, content, len) 收到请求
+ret_t instrument_req(cstr_t id, uint32_t timeout_ms,
+                     cstr_t msg, char *buffer, size_t bufsz);
+
+// 响应 instrument_req 请求
+// rid:     请求方的 rid（来自 instrument_cb 的 rid 参数）
+// reply:   响应文本（写入请求方的 buffer）
+ret_t instrument_resp(uint16_t rid, cstr_t reply);
 ```
 
 ### 广播模式
@@ -906,7 +923,7 @@ int main() {
     instrument_ctrl(200);
     
     // 启动监听
-    if (instrument_listen(on_message) != E_NONE) {
+    if (instrument_listen(on_message, NULL) != E_NONE) {
         fprintf(stderr, "监听失败\n");
         return 1;
     }
