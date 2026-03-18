@@ -757,15 +757,17 @@ P_net_cleanup();
 
 ## 分布式监控
 
-基于 UDP 广播的分布式调试监控系统，支持多节点日志汇聚、乱序处理和远程选项控制。
+基于 UDP 组播的分布式调试监控系统，支持多节点日志汇聚、乱序处理、远程选项控制和跨进程同步等待。
 
-> **注意**：需要在编译时定义 `LOG_INSTRUMENT` 宏启用此功能。
+> **注意**：需要在编译时定义 `LOG_INSTRUMENT` 宏启用此功能。未定义时所有 API 退化为无操作宏。
 
 ### 配置宏
 
 | 宏 | 默认值 | 说明 |
 |-------|---------|-------------|
-| `INSTRUMENT_PORT` | 1980 | 默认通信端口 |
+| `INSTRUMENT_PORT` | 1980 | 默认 UDP 通信端口 |
+| `INSTRUMENT_CTRL` | 255 | 默认控制通道号（用于 WAIT/CONTINUE 握手） |
+| `INSTRUMENT_OPT_BASE` | 0 | 选项索引基址偏移（`instrument_enable`/`instrument_option` 宏自动加上此值） |
 
 ### 类型
 
@@ -774,19 +776,29 @@ P_net_cleanup();
 typedef void(*instrument_cb)(uint16_t rid, uint8_t chn, const char* tag, char *txt, int len);
 // rid: 发送方随机 ID（本地回调时为 0）
 // chn: 消息通道（传输日志时对应 log_level_e）
-// tag: 消息标签
+// tag: 消息标签（WAIT/CONTINUE 包时为 NULL）
 // txt: 消息文本（已追加 '\0' 终止符）
 // len: 消息文本长度（不含 '\0'）
 ```
 
-### 函数
+### 初始化函数
+
+以下函数**必须在首次调用其他 `instrument_*` 函数之前**调用：
 
 ```c
-// 设置通信端口（必须在首次调用其他 instrument_* 函数之前）
+// 设置通信端口（默认 INSTRUMENT_PORT）
 void instrument_port(uint16_t port);
 
+// 设置控制通道号（默认 INSTRUMENT_CTRL）
+void instrument_ctrl(uint16_t chn);
+```
+
+### 监听与模式
+
+```c
 // 启动监听，按 seq 顺序交付消息到回调
-// 内部处理乱序和丢包，丢包时输出 stderr 警告
+// 内部启动接收线程，处理乱序和丢包
+// 每个发送方独立滑动窗口，丢包时输出 stderr 警告
 ret_t instrument_listen(instrument_cb cb);
 
 // 设置本地模式（只触发本地回调，不网络）
@@ -794,19 +806,63 @@ ret_t instrument_listen(instrument_cb cb);
 // 示例: instrument_local(0);           // 关闭全部网络发送
 //       instrument_local('x', 0);      // 保留 'x' 通道
 //       instrument_local('x', 'y', 0); // 保留 'x' 和 'y' 通道
-void instrument_local(uint8_t keep_chn, ...);
+void instrument_local(int keep_chn, ...);
 
 // 设置远程模式（局域网广播）
 void instrument_remote(void);
 
-// 启用/禁用指定选项（通过 UDP 广播同步到所有节点）
-ret_t instrument_enable(uint16_t idx, bool enable);
-
-// 查询指定选项是否启用
-bool instrument_enabled(uint16_t idx);
-
 // 发送消息包（内部调用，通常由日志系统自动触发）
 void instrument_slot(uint8_t chn, const char* tag, const char* fmt, va_list params);
+```
+
+### 选项控制
+
+选项状态通过 UDP 广播同步到所有节点，可用于远程控制功能开关。
+
+**底层函数**（使用绝对索引）：
+
+```c
+// 启用/禁用指定选项
+ret_t instrument_set(uint16_t idx, bool enable);
+
+// 查询指定选项是否启用
+bool instrument_get(uint16_t idx);
+```
+
+**便捷宏**（自动加上 `INSTRUMENT_OPT_BASE` 偏移）：
+
+```c
+// 启用/禁用选项（idx + INSTRUMENT_OPT_BASE）
+instrument_enable(idx, enable)
+
+// 查询选项（idx + INSTRUMENT_OPT_BASE）
+instrument_option(idx)
+```
+
+> **设计说明**：`INSTRUMENT_OPT_BASE` 允许不同模块使用各自的选项索引空间。
+> 例如模块 A 定义 `INSTRUMENT_OPT_BASE 0`，模块 B 定义 `INSTRUMENT_OPT_BASE 10`，
+> 两者都可以使用 `instrument_enable(0, true)` 而不会冲突。
+
+### 同步等待
+
+跨进程的阻塞同步机制，用于多进程测试编排。
+
+```c
+// 阻塞等待对端调用 instrument_continue
+// port:       本方名称（广播给对端，作为 WAIT 消息内容）
+// from:       期望的应答方名称（NULL 或空串表示任意方均可中断）
+// timeout_ms: 超时时间（毫秒），0 表示无限等待
+// 返回: E_NONE 收到 continue，E_TIMEOUT 超时
+ret_t instrument_wait(cstr_t port, cstr_t from, uint32_t timeout_ms);
+
+// 发送 CONTINUE 应答，中断对端的 instrument_wait
+// to:   目标方名称（WAIT 方广播的 port 参数）
+// from: 本方名称（WAIT 方的 from 参数匹配用）
+ret_t instrument_continue(cstr_t to, cstr_t from);
+
+// 全局变量：跟踪 wait 累计时间，用于 tick 计时修正
+// <=0: 累计等待时长 (us) 取反；>0: wait 中冻结的 tick_us
+extern int64_t instrument_waiting;
 ```
 
 ### 广播模式
@@ -816,16 +872,20 @@ void instrument_slot(uint8_t chn, const char* tag, const char* fmt, va_list para
 | **local** | `instrument_local(0)` | 只触发本地回调，不网络 |
 | **local+keep** | `instrument_local('x', 0)` | 本地回调 + 保留通道发送网络 |
 | **host** | **默认** | 本地回调 + `127.0.0.1`（同主机进程可见） |
-| **remote** | `instrument_remote()` | 本地回调 + 局域网广播 |
+| **remote** | `instrument_remote()` | 本地回调 + 局域网组播 |
 
 ### 协议说明
 
-- **传输方式**：UDP 广播，支持局域网内多节点通信
-- **包格式**：`rid(2) + seq(2) + type(1) + payload`
+- **传输方式**：UDP 组播 `239.255.77.77`（RFC 2365 本地管理范围），确保同机所有监听进程均可收到
+- **包格式**：`rid(2) + seq(2) + type(1) + chn(1) + tag_len(1) + payload`
   - `rid`: 节点随机 ID，用于过滤自己的包
-  - `seq`: 序列号，用于顺序交付
-  - `type`: 包类型（0=数据包，1=选项包）
-- **窗口大小**：64，超出窗口时强制交付并报告丢包
+  - `seq`: 序列号，用于顺序交付（type=1/2/3 不占序列号）
+  - `type`: 包类型
+    - `0` = 数据包（tag + text，按 seq 顺序交付）
+    - `1` = 选项包（byte_idx + byte_val，直接处理）
+    - `2` = WAIT 包（port_len + port + from_len + from）
+    - `3` = CONTINUE 包（to_len + to + by_len + by）
+- **滑动窗口**：每个发送方独立 64 槽窗口，支持乱序缓存和丢包检测
 - **MTU**：1400 字节（保守值，适应大多数网络环境）
 
 ### 示例
@@ -837,12 +897,13 @@ void instrument_slot(uint8_t chn, const char* tag, const char* fmt, va_list para
 
 // 消息回调
 void on_message(uint16_t rid, uint8_t chn, const char* tag, char *txt, int len) {
-    printf("[rid=%u chn=%d] %s: %s\n", rid, chn, tag, txt);
+    printf("[rid=%u chn=%d] %s: %s\n", rid, chn, tag ? tag : "(ctrl)", txt);
 }
 
 int main() {
-    // 可选：设置自定义端口
+    // 可选：设置自定义端口和控制通道（必须在其他 instrument 调用之前）
     instrument_port(1981);
+    instrument_ctrl(200);
     
     // 启动监听
     if (instrument_listen(on_message) != E_NONE) {
@@ -854,12 +915,18 @@ int main() {
     // instrument_local(0);
     // instrument_local('x', 0);  // 保留 'x' 通道
     
-    // 远程控制：启用选项 0
+    // 远程控制：启用选项 0（使用宏，自动加 INSTRUMENT_OPT_BASE）
     instrument_enable(0, true);
     
     // 查询选项状态
-    if (instrument_enabled(0)) {
+    if (instrument_option(0)) {
         print("I: 选项 0 已启用\n");
+    }
+    
+    // 也可以使用底层函数直接操作绝对索引
+    instrument_set(42, true);
+    if (instrument_get(42)) {
+        print("I: 绝对索引 42 已启用\n");
     }
     
     // 日志会自动通过 instrument 发送到所有监听节点
@@ -869,6 +936,19 @@ int main() {
     
     return 0;
 }
+```
+
+### 同步等待示例
+
+```c
+// 进程 A：等待进程 B 就绪
+ret_t r = instrument_wait("process_a", "process_b", 10000);
+if (r == E_NONE) {
+    print("I: 进程 B 已就绪，继续执行\n");
+}
+
+// 进程 B：通知进程 A 继续
+instrument_continue("process_a", "process_b");
 ```
 
 ---

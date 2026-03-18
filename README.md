@@ -328,25 +328,35 @@ P_net_cleanup();
 ```c
 // 编译时定义 LOG_INSTRUMENT 启用
 
-// 设置通信端口（可选，默认 1980）
-instrument_port(1981);
+// 初始化配置（可选，必须在其他 instrument 调用之前）
+instrument_port(1981);          // 设置端口（默认 1980）
+instrument_ctrl(200);           // 设置控制通道（默认 255）
 
-// 监听端：接收并回调处理
+// 监听端：接收并按 seq 顺序交付（每个发送方独立滑动窗口）
 instrument_listen(my_callback);
 void my_callback(uint16_t rid, uint8_t chn, const char* tag, char *txt, int len) {
     // rid: 发送方随机 ID（本地回调时为 0）
-    printf("[%d] %s: %s\n", chn, tag, txt);
+    // tag: 消息标签（WAIT/CONTINUE 包时为 NULL）
+    printf("[%d] %s: %s\n", chn, tag ? tag : "(ctrl)", txt);
 }
 
 // 三种广播模式（默认 host 模式）
 instrument_local(0);    // local:  只本地回调，不网络
 instrument_local('x', 0);  // local: 保留 'x' 通道发送网络
 // (默认)                 // host:   本地回调 + 127.0.0.1（同主机进程可见）
-instrument_remote();    // remote: 本地回调 + 局域网广播
+instrument_remote();    // remote: 本地回调 + 局域网组播
 
-// 远程选项控制（广播同步到所有节点）
+// 选项控制 — 宏（自动加 INSTRUMENT_OPT_BASE 偏移）
 instrument_enable(0, true);     // 启用选项 0
-instrument_enabled(0);          // 查询选项 0 是否启用
+instrument_option(0);           // 查询选项 0 是否启用
+
+// 选项控制 — 底层函数（绝对索引）
+instrument_set(42, true);       // 启用绝对索引 42
+instrument_get(42);             // 查询绝对索引 42
+
+// 跨进程同步等待
+instrument_wait("A", "B", 10000);  // A 等待 B，超时 10s
+instrument_continue("A", "B");     // B 通知 A 继续
 ```
 
 ### 终端操作
@@ -404,14 +414,16 @@ P_check(expr, action);          // 运行时断言
 - `P_inet_pton()` / `P_inet_ntop()` - 地址转换
 
 ### 分布式监控 (Instrument)
-- `instrument_port()` - 设置通信端口
-- `instrument_listen()` - 启动监听，按序交付消息
+- `instrument_port()` / `instrument_ctrl()` - 设置通信端口和控制通道
+- `instrument_listen()` - 启动监听，每个发送方独立滑动窗口按序交付
 - `instrument_local(0)` - 设置本地模式（只本地回调，不网络）
 - `instrument_local('x', 0)` - 保留指定通道发送网络
-- `instrument_remote()` - 设置远程模式（局域网广播）
+- `instrument_remote()` - 设置远程模式（局域网组播）
 - 默认主机模式：本地回调 + 127.0.0.1（同主机进程可见）
-- `instrument_enable()` / `instrument_enabled()` - 远程选项控制
-- 编译时定义 `LOG_INSTRUMENT` 启用
+- `instrument_set()` / `instrument_get()` - 选项控制（绝对索引）
+- `instrument_enable()` / `instrument_option()` - 选项控制宏（加 `INSTRUMENT_OPT_BASE` 偏移）
+- `instrument_wait()` / `instrument_continue()` - 跨进程同步等待
+- 编译时定义 `LOG_INSTRUMENT` 启用，`INSTRUMENT_OPT_BASE` 设置选项基址
 
 ### 终端
 - `P_isatty()` - 检测是否为终端
