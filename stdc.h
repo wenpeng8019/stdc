@@ -186,8 +186,10 @@ extern lang_cb                  P_lang;
 
 ///////////////////////////////////////////////////////////////////////////////
 
+#ifndef LOG_INSTRUMENT
 #ifndef NDEBUG
 #define LOG_INSTRUMENT
+#endif
 #endif
 
 #ifndef ROOT_TAG

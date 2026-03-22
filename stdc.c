@@ -39,8 +39,8 @@ static TLS int                  g_inst_in_cb  = 0;                  // 防止回
 static log_cb                   g_inst_log_cb = NULL;               // instrument 内部日志回调
 
 // 本地选项 bitset
-static uint8_t*                 g_inst_bits     = NULL;             // 动态分配
-static uint16_t                 g_inst_bits_len = 0;                // 已分配字节数
+static volatile uint8_t*        g_inst_bits     = NULL;             // 动态分配
+static volatile uint16_t        g_inst_bits_len = 0;                // 已分配字节数
 
 // instrument tick 机制，用于 P_tick_xxx() 相关操作
 int64_t                         instrument_tick = 0;               // <=0: 累计等待时长(us)取反; >0: 冻结tick_us
