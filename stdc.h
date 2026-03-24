@@ -2458,6 +2458,7 @@ static inline ret_t P_join(thd_t hThread, int32_t* r_i32ExitCode/* nullable */) 
 #if P_WIN
 #   include <winsock2.h>
 #   include <ws2tcpip.h>
+#   include <mswsock.h> // WSASendMsg
     // MSVC 自动链接网络库（MinGW 需要在编译时指定 -lws2_32）
 #   if defined(_MSC_VER)
 #       pragma comment(lib, "ws2_32.lib")
@@ -2490,14 +2491,9 @@ static inline ret_t P_join(thd_t hThread, int32_t* r_i32ExitCode/* nullable */) 
 // 注意：inet_pton/inet_ntop 已是标准跨平台 API，无需封装
 
 #if P_WIN
-static inline ret_t P_net_init(void) {
-    WSADATA wsa;
-    int err = WSAStartup(MAKEWORD(2, 2), &wsa);
-    return err == 0 ? E_NONE : E_EXTERNAL(err);
-}
-static inline void P_net_cleanup(void) {
-    WSACleanup();
-}
+extern LPFN_WSASENDMSG fn_WSASendMsg = NULL;
+ret_t P_net_init(void);
+static inline void P_net_cleanup(void) { WSACleanup(); }
 #else
 // 使用 volatile 可避免 "always false" 警告
 #define P_net_init()        ((ret_t)((volatile int){E_NONE}))
@@ -2661,6 +2657,42 @@ static inline ret_t P_sock_rcvbuf(sock_t s, int size) {
     int ret = setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char*)&size, sizeof(size));
     return ret == 0 ? E_NONE : E_EXTERNAL(P_sock_errno());
 }
+
+//-----------------------------------------------------------------------------
+// sendmsg
+//-----------------------------------------------------------------------------
+
+#if P_WIN
+typedef WSAMSG sock_msg_t;
+#define P_msg_buf(msg)  ((const void*)(msg)->buf)
+#define P_msg_len(msg)  ((int)(msg)->len)
+static inline void P_msg_set(sock_msg_t* msg, const void* buf, size_t len) { msg->buf = (char*)buf; msg->len = (ULONG)len; }
+static inline ret_t P_msg_send_to(sock_t s, const sock_msg_t* msgs, size_t num, const struct sockaddr_in* addr) {
+    if (!fn_WSASendMsg) return E_EXTERNAL(WSAENOSYS);
+    WSAMSG mh = {0};
+    mh.name = (LPSOCKADDR)addr;
+    mh.namelen = sizeof(struct sockaddr_in);
+    mh.lpBuffers = (LPWSABUF)msgs;
+    mh.dwBufferCount = (DWORD)num;
+    DWORD bytesSent = 0;
+    int ret = fn_WSASendMsg(s, &mh, 0, &bytesSent, NULL, NULL);
+    return ret == 0 ? (ret_t)bytesSent : E_EXTERNAL(WSAGetLastError());
+}
+#else
+typedef struct iovec sock_msg_t;
+#define P_msg_buf(msg)  ((const void*)(msg)->iov_base)
+#define P_msg_len(msg)  ((int)(msg)->iov_len)
+static inline void P_msg_set(sock_msg_t* msg, const void* buf, size_t len) { msg->iov_base = (void*)buf; msg->iov_len = len; }
+static inline ret_t P_msg_send_to(sock_t s, const sock_msg_t* msgs, size_t num, const struct sockaddr_in* addr) {
+    struct msghdr mh = {0};
+    mh.msg_name = (void*)addr;
+    mh.msg_namelen = sizeof(struct sockaddr_in);
+    mh.msg_iov = (struct iovec*)msgs;
+    mh.msg_iovlen = (int)num;
+    ret_t sz = (ret_t)sendmsg(s, &mh, 0);
+    return sz >= 0 ? sz : E_EXTERNAL(errno);
+}
+#endif
 
 ///////////////////////////////////////////////////////////////////////////////
 // 终端/控制

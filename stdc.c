@@ -103,6 +103,24 @@ static void inst_send_buf(uint8_t chn, char* buf, int tag_len, int text_len);
 #else
 #define LOG_HDR_RESERVE         0
 #endif
+
+#if P_WIN
+LPFN_WSASENDMSG fn_WSASendMsg = NULL;
+ret_t P_net_init(void) {
+    WSADATA wsa;
+    int err = WSAStartup(MAKEWORD(2, 2), &wsa);
+    if (err) return E_EXTERNAL(err);
+
+    if (!fn_WSASendMsg) {
+        GUID guid = WSAID_WSASENDMSG; DWORD bytes;
+        WSAIoctl(sock, SIO_GET_EXTENSION_FUNCTION_POINTER,
+                 &guid, sizeof(guid), &fn_WSASendMsg, sizeof(fn_WSASendMsg),
+                 &bytes, NULL, NULL);
+    }
+    return E_NONE;
+}
+#endif
+
 ///////////////////////////////////////////////////////////////////////////////
 
 /**
